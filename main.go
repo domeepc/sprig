@@ -55,10 +55,10 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   init [--bare] [-b branch] [dir]     create a repository
   clone [-b branch] [--path dir]... <url> <dir>   lazy (and optionally sparse) working copy
   commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]... [--hunk path:N]... [path...]
-  status [--json]                     working tree vs HEAD, pending conflicts
+  status [--json] [-M pct]            working tree vs HEAD, pending conflicts
   log [-n N] [--agent A] [--json] [rev]
-  show [rev]                          a change and its diff
-  diff [revA [revB]]                  working tree vs HEAD, or between two revs
+  show [-M pct] [rev]                 a change and its diff (-M: rename similarity, default 50)
+  diff [-M pct] [revA [revB]]         working tree vs HEAD, or between two revs
   branch [-d] [name [start]]          list, create or delete branches
   checkout [-f] <branch|rev> | checkout -b <name> [start]
   merge [--no-ff] [-m msg] <rev>      conflicts are recorded in the change
@@ -405,6 +405,7 @@ func firstLine(s string) string {
 func cmdStatus(r *Repo, args []string) error {
 	fs := newFlags("status")
 	asJSON := fs.Bool("json", false, "machine-readable output")
+	sim := fs.Int("M", renameThreshold, "rename similarity threshold in percent (0: exact renames only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -417,7 +418,7 @@ func cmdStatus(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
-	deltas = r.withRenames(deltas)
+	deltas = r.withRenamesAt(deltas, *sim)
 	var conflicts []Conflict
 	if head != "" {
 		c, err := r.GetChange(head)
@@ -572,10 +573,10 @@ func cmdLog(r *Repo, args []string) error {
 	return nil
 }
 
-func (r *Repo) diffBetween(a, b Flat) (string, error) {
+func (r *Repo) diffBetween(a, b Flat, sim int) (string, error) {
 	var sb strings.Builder
 	read := func(fe FileEnt) ([]byte, error) { return r.GetBlob(fe.ID) }
-	for _, d := range r.withRenames(DiffFlat(a, b)) {
+	for _, d := range r.withRenamesAt(DiffFlat(a, b), sim) {
 		if d.Kind == "R" {
 			fmt.Fprintf(&sb, "renamed: %s -> %s\n", d.From, d.Path)
 			if d.Old.Mode != d.New.Mode {
@@ -621,6 +622,12 @@ func (r *Repo) diffBetween(a, b Flat) (string, error) {
 }
 
 func cmdShow(r *Repo, args []string) error {
+	fs := newFlags("show")
+	sim := fs.Int("M", renameThreshold, "rename similarity threshold in percent (0: exact renames only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	args = fs.Args()
 	rev := "HEAD"
 	if len(args) > 0 {
 		rev = args[0]
@@ -646,12 +653,18 @@ func cmdShow(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := r.diffBetween(a, b)
+	out, err := r.diffBetween(a, b, *sim)
 	fmt.Fprint(stdout, out)
 	return err
 }
 
 func cmdDiff(r *Repo, args []string) error {
+	fs := newFlags("diff")
+	sim := fs.Int("M", renameThreshold, "rename similarity threshold in percent (0: exact renames only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	args = fs.Args()
 	var a, b Flat
 	var err error
 	switch len(args) {
@@ -685,7 +698,7 @@ func cmdDiff(r *Repo, args []string) error {
 	default:
 		return errors.New("usage: diff [revA [revB]]")
 	}
-	out, err := r.diffBetween(a, b)
+	out, err := r.diffBetween(a, b, *sim)
 	fmt.Fprint(stdout, out)
 	return err
 }
