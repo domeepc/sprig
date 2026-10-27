@@ -1,7 +1,7 @@
 //! Trees, their flat (path -> file) form, tree diffs and rename detection,
 //! and writing files into the working tree.
 
-use crate::store::{valid_name, valid_path, Repo, TREE};
+use crate::store::{Repo, TREE, valid_name, valid_path};
 use crate::util::{self, Result};
 use crate::{bail, err};
 use serde::{Deserialize, Serialize};
@@ -280,7 +280,8 @@ impl Repo {
                         bail!("path {name:?} is both a file and a directory");
                     }
                     sub.remove(name); // only removals of what this file replaces
-                    by_name.insert(name.to_string(), Entry { name: name.to_string(), mode: fe.mode, id: fe.id.clone() });
+                    by_name
+                        .insert(name.to_string(), Entry { name: name.to_string(), mode: fe.mode, id: fe.id.clone() });
                 }
                 None => {
                     by_name.remove(*name);
@@ -547,7 +548,13 @@ impl Repo {
     /// Writes one working file. dirs remembers directories already checked
     /// during this checkout; same_mode says the file is already there with
     /// the right permissions.
-    pub fn write_file_in(&self, rel: &str, fe: &FileEnt, dirs: Option<&mut HashSet<String>>, same_mode: bool) -> Result<()> {
+    pub fn write_file_in(
+        &self,
+        rel: &str,
+        fe: &FileEnt,
+        dirs: Option<&mut HashSet<String>>,
+        same_mode: bool,
+    ) -> Result<()> {
         if !valid_path(rel) {
             bail!("refusing to write outside the repository: {rel}");
         }

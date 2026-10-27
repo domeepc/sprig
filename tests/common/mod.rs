@@ -114,12 +114,9 @@ impl Ctx {
             .envs(self.env.borrow().iter())
             .output()
             .unwrap();
-        let (o, e) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
-        if out.status.success() {
-            Ok(o)
-        } else {
-            Err(Failed { code: out.status.code().unwrap_or(-1), out: o, err: e })
-        }
+        let (o, e) =
+            (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        if out.status.success() { Ok(o) } else { Err(Failed { code: out.status.code().unwrap_or(-1), out: o, err: e }) }
     }
 
     #[track_caller]
@@ -236,7 +233,9 @@ pub fn counting_proxy(url: &str) -> (String, Arc<Mutex<Vec<String>>>) {
                 let hdr: Vec<(&str, &str)> = hdr.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let resp = up.send(req.method().as_str(), &path, &body, &hdr).unwrap();
                 let mut out = tiny_http::Response::from_data(resp.data).with_status_code(resp.status);
-                for (k, v) in [("Content-Type", &resp.content_type), ("X-Sprig-Type", &resp.typ), ("X-Sprig-Mode", &resp.mode)] {
+                for (k, v) in
+                    [("Content-Type", &resp.content_type), ("X-Sprig-Type", &resp.typ), ("X-Sprig-Mode", &resp.mode)]
+                {
                     if !v.is_empty() {
                         out = out.with_header(tiny_http::Header::from_bytes(k, v.as_bytes()).unwrap());
                     }
@@ -263,7 +262,12 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         .env("HOME", dir)
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

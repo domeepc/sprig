@@ -1,9 +1,9 @@
 //! Converting to and from git: import reads objects through one long-lived
 //! `git cat-file --batch`, export writes a `git fast-import` stream.
 
-use crate::store::{is_id, short, valid_ref_name, Change, Repo, CHANGE, TREE};
+use crate::store::{CHANGE, Change, Repo, TREE, is_id, short, valid_ref_name};
 use crate::tree::Mode;
-use crate::util::{go_json_str, go_lossy, Result};
+use crate::util::{Result, go_json_str, go_lossy};
 use crate::{bail, err};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -101,7 +101,11 @@ impl Repo {
         if branches.is_empty() {
             bail!("git repository has no branches with commits");
         }
-        let raw_len = if git_output(git_dir, &["rev-parse", "--show-object-format"]).is_ok_and(|f| f == "sha256") { 32 } else { 20 };
+        let raw_len = if git_output(git_dir, &["rev-parse", "--show-object-format"]).is_ok_and(|f| f == "sha256") {
+            32
+        } else {
+            20
+        };
         let mut args = vec!["rev-list", "--topo-order", "--reverse", "--parents"];
         args.extend(branches.iter().map(|(_, sha)| sha.as_str()));
         let revs = git_output(git_dir, &args)?;
@@ -219,13 +223,14 @@ impl Importer<'_> {
         let msg = &msg[..msg.iter().rposition(|&c| c != b'\n').map_or(0, |i| i + 1)];
         // A commit written by export-git maps back to its change, provided
         // the content and parents really match (the trailer alone is just text).
-        if let Some(xid) = sprig_trailer(&go_lossy(msg)) {
-            if self.r.get_change(&xid).is_ok_and(|x| x.tree == tree && x.parents == pids) {
-                self.changes.insert(sha.to_string(), xid);
-                return Ok(());
-            }
+        if let Some(xid) = sprig_trailer(&go_lossy(msg))
+            && self.r.get_change(&xid).is_ok_and(|x| x.tree == tree && x.parents == pids)
+        {
+            self.changes.insert(sha.to_string(), xid);
+            return Ok(());
         }
-        let mut j = format!("{{\"parents\":{},\"tree\":\"{tree}\",\"author\":", serde_json::to_string(&pids)?).into_bytes();
+        let mut j =
+            format!("{{\"parents\":{},\"tree\":\"{tree}\",\"author\":", serde_json::to_string(&pids)?).into_bytes();
         go_json_str(&mut j, &author);
         j.extend_from_slice(format!(",\"time\":{ts}").as_bytes());
         if !tz.is_empty() {
@@ -329,10 +334,10 @@ struct Exporter<'a, W: Write> {
     dir: &'a str,
     w: W,
     next: usize,
-    blobs: HashMap<String, usize>,     // sprig blob id -> fast-import mark
-    commits: HashMap<String, String>,  // sprig change id -> git sha or ":mark"
-    known: BTreeMap<String, String>,   // sprig change id -> git sha from earlier exports
-    marks: HashMap<usize, String>,     // fast-import mark -> sprig change id
+    blobs: HashMap<String, usize>,    // sprig blob id -> fast-import mark
+    commits: HashMap<String, String>, // sprig change id -> git sha or ":mark"
+    known: BTreeMap<String, String>,  // sprig change id -> git sha from earlier exports
+    marks: HashMap<usize, String>,    // fast-import mark -> sprig change id
     written: usize,
 }
 
@@ -454,7 +459,11 @@ impl<W: Write> Exporter<'_, W> {
                 self.write_commit(&id, &c)?;
                 continue;
             }
-            let sha = if c.meta.git_sha.is_empty() { self.known.get(&id).cloned().unwrap_or_default() } else { c.meta.git_sha.clone() };
+            let sha = if c.meta.git_sha.is_empty() {
+                self.known.get(&id).cloned().unwrap_or_default()
+            } else {
+                c.meta.git_sha.clone()
+            };
             let exists = !sha.is_empty()
                 && Command::new("git")
                     .args(["-C", self.dir, "cat-file", "-e", &format!("{sha}^{{commit}}")])
@@ -542,7 +551,9 @@ fn go_fields(b: &[u8]) -> Vec<&[u8]> {
     let mut out = vec![];
     let (mut i, mut start) = (0, None);
     while i < b.len() {
-        let (space, n) = match std::str::from_utf8(&b[i..(i + 4).min(b.len())]).or_else(|e| std::str::from_utf8(&b[i..i + e.valid_up_to()])) {
+        let (space, n) = match std::str::from_utf8(&b[i..(i + 4).min(b.len())])
+            .or_else(|e| std::str::from_utf8(&b[i..i + e.valid_up_to()]))
+        {
             Ok(s) if !s.is_empty() => {
                 let c = s.chars().next().unwrap();
                 (c.is_whitespace(), c.len_utf8())

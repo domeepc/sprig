@@ -13,7 +13,10 @@ pub enum Error {
     NotFound(String),
     Io(std::io::Error),
     /// A remote server answered with an error status.
-    Remote { code: u16, msg: String },
+    Remote {
+        code: u16,
+        msg: String,
+    },
     /// Exit with this code, printing the message if it is not empty.
     Exit(i32, String),
     NothingToCommit,
@@ -98,7 +101,7 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let v = |c: u8| match c {

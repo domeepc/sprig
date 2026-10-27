@@ -16,9 +16,9 @@
 //! before the scan that saved the index are not trusted ("racily clean", as
 //! git calls it), unless a `sprig watch` vouches for that time.
 
-use crate::store::{hash_object, Config, Repo, BLOB};
-use crate::tree::{ignored, link_bytes, Delta, FileEnt, Mode};
-use crate::util::{hex, now_ns, raw_id, Result};
+use crate::store::{BLOB, Config, Repo, hash_object};
+use crate::tree::{Delta, FileEnt, Mode, ignored, link_bytes};
+use crate::util::{Result, hex, now_ns, raw_id};
 use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Range;
@@ -113,7 +113,8 @@ impl Index {
         let tlen = (b.len() - table) as u64;
         for i in 0..n {
             let r = &b[HEADER + i * REC..];
-            let (off, len) = (u32::from_le_bytes(r[..4].try_into().unwrap()), u32::from_le_bytes(r[4..8].try_into().unwrap()));
+            let (off, len) =
+                (u32::from_le_bytes(r[..4].try_into().unwrap()), u32::from_le_bytes(r[4..8].try_into().unwrap()));
             if off as u64 + len as u64 > tlen || r[8] > 3 || r[9] > 3 {
                 return Index::empty();
             }
@@ -382,10 +383,7 @@ fn mtime_ns(md: &fs::Metadata) -> i64 {
 
 #[cfg(not(unix))]
 fn mtime_ns(md: &fs::Metadata) -> i64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos() as i64)
+    md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64)
 }
 
 /// What a walk saw: records confirmed by stat, and files read afresh.
@@ -422,20 +420,19 @@ impl Walk<'_> {
     fn file(&self, abs: &std::path::Path, rel: String, md: &fs::Metadata, seen: &mut Seen) -> Result<()> {
         let Some(st) = work_of(md, String::new()) else { return Ok(()) };
         let i = self.idx.find(rel.as_bytes());
-        if let Some(i) = i {
-            if let Some((mode, id)) = self.idx.work_raw(i) {
-                let r = self.idx.rec(i);
-                let (size, mtime) =
-                    (u64::from_le_bytes(r[12..20].try_into().unwrap()), i64::from_le_bytes(r[20..28].try_into().unwrap()));
-                if mode == st.mode && size == st.size && mtime == st.mtime && mtime < self.racy {
-                    // committing needs the content stored; HEAD's already is
-                    let stored = !self.store
-                        || self.idx.head_raw(i).is_some_and(|(_, h)| h == id)
-                        || self.repo.has_object(&hex(id));
-                    if stored {
-                        seen.matched.push(i as u32);
-                        return Ok(());
-                    }
+        if let Some(i) = i
+            && let Some((mode, id)) = self.idx.work_raw(i)
+        {
+            let r = self.idx.rec(i);
+            let (size, mtime) =
+                (u64::from_le_bytes(r[12..20].try_into().unwrap()), i64::from_le_bytes(r[20..28].try_into().unwrap()));
+            if mode == st.mode && size == st.size && mtime == st.mtime && mtime < self.racy {
+                // committing needs the content stored; HEAD's already is
+                let stored =
+                    !self.store || self.idx.head_raw(i).is_some_and(|(_, h)| h == id) || self.repo.has_object(&hex(id));
+                if stored {
+                    seen.matched.push(i as u32);
+                    return Ok(());
                 }
             }
         }
@@ -568,11 +565,8 @@ impl Repo {
         let tree = self.tree_of(&head)?;
         let (idx, mut dirty) = self.index_for(&tree)?;
         let cfg = self.load_config();
-        let (dirty_paths, watched, running) = if idx.n > 0 {
-            crate::watch::ask_watcher_since(self, idx.written)
-        } else {
-            (vec![], false, false)
-        };
+        let (dirty_paths, watched, running) =
+            if idx.n > 0 { crate::watch::ask_watcher_since(self, idx.written) } else { (vec![], false, false) };
         let roots = if watched { outermost(dirty_paths) } else { vec![String::new()] };
 
         let walk = Walk {

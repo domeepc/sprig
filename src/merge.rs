@@ -4,9 +4,9 @@
 use crate::diff::{apply_hunks, is_binary, merge3, split_lines};
 use crate::index::work_of;
 use crate::sign;
-use crate::store::{under, Change, Conflict, Meta, Op, Repo};
-use crate::tree::{apply_deltas, has_markers, FileEnt, Flat, Mode};
-use crate::util::{self, dir_name, Error, Result};
+use crate::store::{Change, Conflict, Meta, Op, Repo, under};
+use crate::tree::{FileEnt, Flat, Mode, apply_deltas, has_markers};
+use crate::util::{self, Error, Result, dir_name};
 use crate::{bail, err};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
@@ -156,11 +156,8 @@ impl Repo {
         }
         let follow = |ren: &HashMap<String, String>, side: &mut Flat| {
             let dirs = dir_renames(base, ren);
-            let add: Vec<String> = side
-                .keys()
-                .filter(|p| !base.contains_key(*p) && dirs.contains_key(dir_name(p)))
-                .cloned()
-                .collect();
+            let add: Vec<String> =
+                side.keys().filter(|p| !base.contains_key(*p) && dirs.contains_key(dir_name(p))).cloned().collect();
             for p in add {
                 let to = format!("{}/{}", dirs[dir_name(&p)], util::base_name(&p));
                 mv(side, &p, &to);
@@ -175,7 +172,14 @@ impl Repo {
     /// cannot be merged cleanly are written with conflict markers (text) or
     /// keep our side (binary/symlink/delete-vs-modify) and are reported as
     /// conflicts.
-    pub fn merge_flat(&self, base: &Flat, ours: &Flat, theirs: &Flat, ol: &str, tl: &str) -> Result<(Flat, Vec<Conflict>)> {
+    pub fn merge_flat(
+        &self,
+        base: &Flat,
+        ours: &Flat,
+        theirs: &Flat,
+        ol: &str,
+        tl: &str,
+    ) -> Result<(Flat, Vec<Conflict>)> {
         let paths: BTreeSet<&String> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
         let mut out = Flat::new();
         let mut conflicts = vec![];
@@ -256,10 +260,10 @@ impl Repo {
             return Ok((FileEnt::new(o.mode, o.id.clone()), Some(cf)));
         }
         let res = merge3(&split_lines(&bd), &split_lines(&od), &split_lines(&td), ol, tl);
-        if res.conflicts > 0 {
-            if let Some(merged) = crate::codemerge::code_merge(p, &bd, &od, &td) {
-                return Ok((FileEnt::new(mode, self.put_blob(&merged)?), None));
-            }
+        if res.conflicts > 0
+            && let Some(merged) = crate::codemerge::code_merge(p, &bd, &od, &td)
+        {
+            return Ok((FileEnt::new(mode, self.put_blob(&merged)?), None));
         }
         let id = self.put_blob(&res.text())?;
         if res.conflicts == 0 {
@@ -272,7 +276,14 @@ impl Repo {
     // -----------------------------------------------------------------------
     // Commands on history
 
-    pub fn new_change(&self, parents: Vec<String>, tree: String, msg: &str, meta: Meta, conflicts: Vec<Conflict>) -> Change {
+    pub fn new_change(
+        &self,
+        parents: Vec<String>,
+        tree: String,
+        msg: &str,
+        meta: Meta,
+        conflicts: Vec<Conflict>,
+    ) -> Change {
         let mut c = Change {
             parents,
             tree,
@@ -299,9 +310,7 @@ impl Repo {
         let (_, head) = self.head();
         let parent = if head.is_empty() { None } else { Some(self.get_change(&head)?) };
         let st = self.work_status(true)?;
-        let picked = |p: &str| {
-            (o.paths.is_empty() && o.hunks.is_empty()) || o.paths.iter().any(|pre| under(p, pre))
-        };
+        let picked = |p: &str| (o.paths.is_empty() && o.hunks.is_empty()) || o.paths.iter().any(|pre| under(p, pre));
         let mut edits: BTreeMap<String, Option<FileEnt>> =
             st.deltas.iter().filter(|d| picked(&d.path)).map(|d| (d.path.clone(), d.new.clone())).collect();
         for (p, nums) in &o.hunks {
@@ -464,11 +473,7 @@ impl Repo {
         if create {
             self.write_ref(&head_ref, &target)?;
         }
-        if head_ref.is_empty() {
-            self.set_head_detached(&target)
-        } else {
-            self.set_head_ref(&head_ref)
-        }
+        if head_ref.is_empty() { self.set_head_detached(&target) } else { self.set_head_ref(&head_ref) }
     }
 
     /// Reverts the most recent recorded operation. Because undo is itself

@@ -13,7 +13,7 @@
 //! incrementally.
 
 use crate::server::in_scope;
-use crate::store::{hash_object, write_file_atomic, Change, Repo};
+use crate::store::{Change, Repo, hash_object, write_file_atomic};
 use crate::tree::{Entry, Mode, Tree};
 use crate::util::{self, Result};
 use serde::{Deserialize, Serialize};

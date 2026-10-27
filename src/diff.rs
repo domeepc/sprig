@@ -56,11 +56,8 @@ fn matching_blocks(a: &[Line], b: &[Line]) -> Vec<Match> {
         let mut l = vec![0u32; (ma.len() + 1) * w];
         for i in (0..ma.len()).rev() {
             for j in (0..mb.len()).rev() {
-                l[i * w + j] = if ma[i] == mb[j] {
-                    l[(i + 1) * w + j + 1] + 1
-                } else {
-                    l[(i + 1) * w + j].max(l[i * w + j + 1])
-                };
+                l[i * w + j] =
+                    if ma[i] == mb[j] { l[(i + 1) * w + j + 1] + 1 } else { l[(i + 1) * w + j].max(l[i * w + j + 1]) };
             }
         }
         let (mut i, mut j) = (0, 0);
@@ -290,10 +287,24 @@ mod tests {
             ("disjoint edits", "a\nb\nc\nd\ne\n", "A\nb\nc\nd\ne\n", "a\nb\nc\nd\nE\n", "A\nb\nc\nd\nE\n", 0),
             ("same edit both sides", "a\nb\n", "a\nX\n", "a\nX\n", "a\nX\n", 0),
             ("only theirs changed", "a\nb\n", "a\nb\n", "a\nb\nc\n", "a\nb\nc\n", 0),
-            ("conflict", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n", "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\nc\n", 1),
+            (
+                "conflict",
+                "a\nb\nc\n",
+                "a\nX\nc\n",
+                "a\nY\nc\n",
+                "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\nc\n",
+                1,
+            ),
             ("both insert different", "a\n", "a\nx\n", "a\ny\n", "a\n<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n", 1),
             ("one deletes other untouched", "a\nb\nc\n", "a\nc\n", "a\nb\nc\n", "a\nc\n", 0),
-            ("add vs delete elsewhere", "a\nb\nc\nd\ne\nf\n", "a\nb\nc\nd\ne\nf\ng\n", "b\nc\nd\ne\nf\n", "b\nc\nd\ne\nf\ng\n", 0),
+            (
+                "add vs delete elsewhere",
+                "a\nb\nc\nd\ne\nf\n",
+                "a\nb\nc\nd\ne\nf\ng\n",
+                "b\nc\nd\ne\nf\n",
+                "b\nc\nd\ne\nf\ng\n",
+                0,
+            ),
             ("empty base both add same", "", "x\n", "x\n", "x\n", 0),
             ("no trailing newline conflict", "a", "b", "c", "<<<<<<< ours\nb\n=======\nc\n>>>>>>> theirs\n", 1),
         ] {

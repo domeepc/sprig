@@ -6,8 +6,8 @@ mod common;
 use common::*;
 use sprig::remote::{LandFile, LandRequest, RefUpdate, Remote};
 use sprig::server::{Scope, Server};
-use sprig::sign::{land_payload, sign, LandProof};
-use sprig::store::{hash_object, short, BLOB};
+use sprig::sign::{LandProof, land_payload, sign};
+use sprig::store::{BLOB, hash_object, short};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -302,7 +302,10 @@ fn caches_land_on_separate_disks() {
     let tip = s.repo.read_ref("heads/main").unwrap();
     assert_eq!(s.repo.change_flat(&tip).unwrap().len(), 22, "2 seeded files and 20 landed");
     let seen = seen.lock().unwrap();
-    assert!(!seen.iter().any(|r| r.contains("/v1/land")), "a landing reached the main server; the cache should merge it");
+    assert!(
+        !seen.iter().any(|r| r.contains("/v1/land")),
+        "a landing reached the main server; the cache should merge it"
+    );
     let swaps = seen.iter().filter(|r| r.starts_with("POST /v1/refs/")).count();
     assert!(swaps >= 20, "expected one ref swap per landing, saw {swaps}");
     for (cs, _) in &caches {
@@ -335,7 +338,10 @@ fn lazy_sparse_clone() {
     c.must(&["push"]);
     let tip = s.repo.read_ref("heads/main").unwrap();
     let flat = s.repo.change_flat(&tip).unwrap();
-    assert!(flat.contains_key("a.txt") && flat.contains_key("d/y.txt"), "push from a sparse clone lost files: {flat:?}");
+    assert!(
+        flat.contains_key("a.txt") && flat.contains_key("d/y.txt"),
+        "push from a sparse clone lost files: {flat:?}"
+    );
 }
 
 #[test]
@@ -449,7 +455,10 @@ fn land_follows_rename() {
         base: stale,
         message: "edit a".into(),
         author: "x <x@y>".into(),
-        files: BTreeMap::from([("a.txt".to_string(), Some(LandFile { mode: "file".into(), data: edited.into_bytes() }))]),
+        files: BTreeMap::from([(
+            "a.txt".to_string(),
+            Some(LandFile { mode: "file".into(), data: edited.into_bytes() }),
+        )]),
         ..Default::default()
     };
     lr.sig = Some(sign(&key, &land_payload(&proof, &lr.message, &lr.author, &lr.meta)));

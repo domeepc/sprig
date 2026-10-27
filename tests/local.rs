@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use sprig::pack::{AUTO_GC_LOOSE, REPACK_AT};
-use sprig::store::{children, hash_object, Change, Conflict, Repo, BLOB, TREE};
+use sprig::store::{BLOB, Change, Conflict, Repo, TREE, children, hash_object};
 use sprig::tree::{Entry, FileEnt, Flat, Mode, Tree};
 use std::collections::BTreeMap;
 
@@ -45,7 +45,19 @@ fn commit_log_status() {
     c.write("sub/b.txt", "world\n");
     let out = c.must(&["status"]);
     assert!(out.contains("A a.txt") && out.contains("A sub/b.txt"), "{out}");
-    c.must(&["commit", "-m", "first", "--intent", "bootstrap", "--agent", "claude", "--model", "m1", "--check", "tests=pass"]);
+    c.must(&[
+        "commit",
+        "-m",
+        "first",
+        "--intent",
+        "bootstrap",
+        "--agent",
+        "claude",
+        "--model",
+        "m1",
+        "--check",
+        "tests=pass",
+    ]);
     assert!(c.must(&["status"]).contains("working tree clean"));
     assert!(c.sp(&["commit", "-m", "again"]).is_err(), "empty commit should fail");
     c.write("a.txt", "hello there\n");
@@ -71,7 +83,10 @@ fn ignore() {
     c.write("keep.txt", "keep");
     c.must(&["commit", "-m", "x"]);
     let out = c.must(&["show"]);
-    assert!(!out.contains("added: x.log") && !out.contains("build/out.bin") && out.contains("added: keep.txt"), "{out}");
+    assert!(
+        !out.contains("added: x.log") && !out.contains("build/out.bin") && out.contains("added: keep.txt"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -352,11 +367,16 @@ fn diff_trees_matches_flat() {
     let c = Ctx::new();
     let r = c.repo();
     let mk = |files: &[(&str, &str)]| -> (String, Flat) {
-        let f: Flat = files.iter().map(|(p, d)| (p.to_string(), FileEnt::new(Mode::File, r.put_blob(d.as_bytes()).unwrap()))).collect();
+        let f: Flat = files
+            .iter()
+            .map(|(p, d)| (p.to_string(), FileEnt::new(Mode::File, r.put_blob(d.as_bytes()).unwrap())))
+            .collect();
         (r.build_tree(&f).unwrap(), f)
     };
-    let (ta, fa) = mk(&[("a", "1"), ("d/x", "2"), ("d/y", "3"), ("e/f/g", "4"), ("same/s", "5"), ("file-then-dir", "6")]);
-    let (tb, fb) = mk(&[("a", "1!"), ("d/x", "2"), ("e/new", "7"), ("same/s", "5"), ("file-then-dir/inside", "8"), ("n/m", "9")]);
+    let (ta, fa) =
+        mk(&[("a", "1"), ("d/x", "2"), ("d/y", "3"), ("e/f/g", "4"), ("same/s", "5"), ("file-then-dir", "6")]);
+    let (tb, fb) =
+        mk(&[("a", "1!"), ("d/x", "2"), ("e/new", "7"), ("same/s", "5"), ("file-then-dir/inside", "8"), ("n/m", "9")]);
     assert_eq!(r.diff_trees(&ta, &tb).unwrap(), sprig::tree::diff_flat(&fa, &fb));
     assert_eq!(r.diff_trees("", &tb).unwrap().len(), fb.len());
 }
@@ -424,7 +444,11 @@ fn gc_packs() {
     }
     let before = c.must(&["log", "--json", "-n", "100"]);
     let out = c.must(&["gc"]);
-    let nums: Vec<u64> = out[out.find(": ").unwrap() + 2..].split(" KB").take(2).map(|s| s.trim_start_matches(" -> ").trim().parse().unwrap()).collect();
+    let nums: Vec<u64> = out[out.find(": ").unwrap() + 2..]
+        .split(" KB")
+        .take(2)
+        .map(|s| s.trim_start_matches(" -> ").trim().parse().unwrap())
+        .collect();
     assert!(out.contains("as deltas") && nums[1] * 3 <= nums[0], "gc did not shrink storage much: {out}");
     let r = c.repo();
     assert_eq!(std::fs::read_dir(r.dir.join("objects")).unwrap().count(), 0, "loose objects left");
@@ -544,7 +568,10 @@ fn import_git() {
     assert_eq!(items.iter().filter(|it| it.change.parents.len() == 2).count(), 1);
     for it in &items {
         let ch = &it.change;
-        assert!(ch.author == "Gina <gina@example.com>" && !ch.meta.git_sha.is_empty() && ch.time == 1709290800, "{ch:?}");
+        assert!(
+            ch.author == "Gina <gina@example.com>" && !ch.meta.git_sha.is_empty() && ch.time == 1709290800,
+            "{ch:?}"
+        );
     }
     assert_eq!(items[4].change.message, "initial\n\nbody text");
     assert!(c.must(&["branch"]).contains("feature"));

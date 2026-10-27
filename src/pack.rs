@@ -14,9 +14,9 @@
 //! bytes. v1 packs (no magic) are zlib streams with a text header, and stay
 //! readable.
 
-use crate::store::{hash_object, is_id, obj_type, short, write_file_atomic, Repo, BLOB, CHANGE, TREE};
-use crate::tree::{parse_tree, Entry, Mode, Tree};
-use crate::util::{hex, put_uvarint, raw_id, uvarint, Error, Result};
+use crate::store::{BLOB, CHANGE, Repo, TREE, hash_object, is_id, obj_type, short, write_file_atomic};
+use crate::tree::{Entry, Mode, Tree, parse_tree};
+use crate::util::{Error, Result, hex, put_uvarint, raw_id, uvarint};
 use crate::{bail, err};
 use std::collections::HashMap;
 use std::fs;
@@ -90,10 +90,11 @@ impl ObjCache {
     }
 
     fn put(&mut self, key: String, c: Cached) {
-        let size = 64 + match &c {
-            Cached::Obj(o) => o.data.len() + o.body.as_ref().map_or(0, |b| b.len()),
-            Cached::Entry(e) => e.body.len(),
-        };
+        let size = 64
+            + match &c {
+                Cached::Obj(o) => o.data.len() + o.body.as_ref().map_or(0, |b| b.len()),
+                Cached::Entry(e) => e.body.len(),
+            };
         if size > CACHE_MAX / 8 {
             return; // one huge object should not flush everything else
         }
@@ -256,11 +257,8 @@ impl Repo {
             .filter_map(|e| e.file_name().to_str()?.strip_suffix(".idx").map(String::from))
             .collect();
         names.sort();
-        ps.packs = names
-            .iter()
-            .filter_map(|n| load_pack(&self.pack_dir().join(n).to_string_lossy()))
-            .map(Arc::new)
-            .collect();
+        ps.packs =
+            names.iter().filter_map(|n| load_pack(&self.pack_dir().join(n).to_string_lossy())).map(Arc::new).collect();
         ps.loaded = mtime;
         ps.packs.clone()
     }
@@ -328,7 +326,8 @@ impl Repo {
     /// The object id at off in p, expanded and hash-checked.
     fn object_at(&self, p: &Pack, off: u64, id: &str, depth: usize) -> Result<Obj> {
         let e = self.read_entry(p, off, id, depth)?;
-        let data: Arc<[u8]> = if e.ctree { expand_tree(&e.body).map_err(|err| corrupt(id, err))?.into() } else { e.body.clone() };
+        let data: Arc<[u8]> =
+            if e.ctree { expand_tree(&e.body).map_err(|err| corrupt(id, err))?.into() } else { e.body.clone() };
         if hash_object(e.typ, &data) != id {
             return Err(corrupt(id, "hash mismatch"));
         }
@@ -362,11 +361,8 @@ impl Repo {
             if entry.len() != n as usize {
                 return Err(corrupt(id, "bad entry length"));
             }
-            let body = if entry[0] == 1 {
-                unzstd(&entry[1..]).map_err(|e| corrupt(id, e))?
-            } else {
-                entry[1..].to_vec()
-            };
+            let body =
+                if entry[0] == 1 { unzstd(&entry[1..]).map_err(|e| corrupt(id, e))? } else { entry[1..].to_vec() };
             if body.len() < 3 || body[0] as usize >= PACK_TYPES.len() || body[1] > 1 {
                 return Err(corrupt(id, "bad entry header"));
             }
@@ -386,9 +382,9 @@ impl Repo {
                     let form = match (ctree, b.body) {
                         (false, _) => b.data,
                         (true, Some(c)) => c,
-                        (true, None) => {
-                            compact_tree(&b.data).ok_or_else(|| corrupt(id, "delta base is not a compactable tree"))?.into()
-                        }
+                        (true, None) => compact_tree(&b.data)
+                            .ok_or_else(|| corrupt(id, "delta base is not a compactable tree"))?
+                            .into(),
                     };
                     (typ, ctree, rest[32..].to_vec(), Some(form))
                 }
@@ -399,7 +395,9 @@ impl Repo {
             let mut raw = Vec::new();
             let limit = (MAX_OBJECT_SIZE * 2) as u64;
             match m {
-                Some(m) => flate2::read::ZlibDecoder::new(&m[(off as usize).min(m.len())..]).take(limit).read_to_end(&mut raw),
+                Some(m) => {
+                    flate2::read::ZlibDecoder::new(&m[(off as usize).min(m.len())..]).take(limit).read_to_end(&mut raw)
+                }
                 None => {
                     use std::io::Seek;
                     let mut f = f.try_clone()?;
@@ -536,10 +534,10 @@ impl Repo {
         let mut seen = std::collections::HashSet::new();
         for tip in self.list_refs().values() {
             let _ = self.walk(tip, |id, c| {
-                if seen.insert(id.to_string()) {
-                    if let Some(pc) = c.parents.first().and_then(|p| self.get_change(p).ok()) {
-                        self.pair_versions(&pc.tree, &c.tree, &mut prev);
-                    }
+                if seen.insert(id.to_string())
+                    && let Some(pc) = c.parents.first().and_then(|p| self.get_change(p).ok())
+                {
+                    self.pair_versions(&pc.tree, &c.tree, &mut prev);
                 }
                 true
             });
@@ -599,38 +597,39 @@ impl Repo {
             let mut head = vec![tbyte, enc, 0];
             let mut payload = &body[..];
             let delta;
-            if let (Some(b), true) = (prev.get(id), o.typ != CHANGE && depth[id] > 0) {
-                if let Ok(bo) = self.read_local_at(b, 0).filter_typ(o.typ) {
-                    let bform = if enc == 1 {
-                        bo.body.as_deref().map(<[u8]>::to_vec).or_else(|| compact_tree(&bo.data))
-                    } else {
-                        Some(bo.data.to_vec())
-                    };
-                    if let Some(bdata) = bform {
-                        let d = best_delta(&bdata, &body);
-                        if d.len() < body.len() * 3 / 4 {
-                            head.truncate(2);
-                            match written.get(b) {
-                                Some(&boff) => {
-                                    head.push(1);
-                                    put_uvarint(&mut head, boff);
-                                }
-                                None => {
-                                    head.push(2);
-                                    head.extend_from_slice(&raw_id(b).unwrap());
-                                }
+            if let (Some(b), true) = (prev.get(id), o.typ != CHANGE && depth[id] > 0)
+                && let Ok(bo) = self.read_local_at(b, 0).filter_typ(o.typ)
+            {
+                let bform = if enc == 1 {
+                    bo.body.as_deref().map(<[u8]>::to_vec).or_else(|| compact_tree(&bo.data))
+                } else {
+                    Some(bo.data.to_vec())
+                };
+                if let Some(bdata) = bform {
+                    let d = best_delta(&bdata, &body);
+                    if d.len() < body.len() * 3 / 4 {
+                        head.truncate(2);
+                        match written.get(b) {
+                            Some(&boff) => {
+                                head.push(1);
+                                put_uvarint(&mut head, boff);
                             }
-                            delta = d;
-                            payload = &delta;
-                            res.deltas += 1;
+                            None => {
+                                head.push(2);
+                                head.extend_from_slice(&raw_id(b).unwrap());
+                            }
                         }
+                        delta = d;
+                        payload = &delta;
+                        res.deltas += 1;
                     }
                 }
             }
             let mut plain = head;
             plain.extend_from_slice(payload);
             let z = zstd.compress(&plain)?;
-            let entry: Vec<u8> = if z.len() < plain.len() { [&[1u8][..], &z].concat() } else { [&[0u8][..], &plain].concat() };
+            let entry: Vec<u8> =
+                if z.len() < plain.len() { [&[1u8][..], &z].concat() } else { [&[0u8][..], &plain].concat() };
             ents.push((raw_id(id).unwrap(), off));
             written.insert(id.clone(), off);
             let mut n = vec![];
@@ -784,7 +783,8 @@ pub fn decode_compact(mut b: &[u8]) -> Result<Tree> {
     b = &b[k..];
     let mut t = Tree { entries: Vec::with_capacity(n as usize) };
     for _ in 0..n {
-        let mode = *b.first().and_then(|&m| TREE_MODES.get(m as usize)).ok_or_else(|| err!("bad compact tree entry"))?;
+        let mode =
+            *b.first().and_then(|&m| TREE_MODES.get(m as usize)).ok_or_else(|| err!("bad compact tree entry"))?;
         let (l, k) = uvarint(&b[1..]).ok_or_else(|| err!("bad compact tree entry"))?;
         let (l, start) = (l as usize, 1 + k);
         if b.len() < start + l + 32 {
@@ -884,29 +884,32 @@ pub fn block_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
     let (mut pending, mut i) = (0, 0);
     let mut h = hash(target);
     while i + DELTA_BLOCK <= target.len() {
-        if let Some(&j0) = at.get(&h) {
-            if base[j0..j0 + DELTA_BLOCK] == target[i..i + DELTA_BLOCK] {
-                let mut j = j0;
-                while j > 0 && i > pending && base[j - 1] == target[i - 1] {
-                    i -= 1;
-                    j -= 1;
-                }
-                let mut n = DELTA_BLOCK;
-                while j + n < base.len() && i + n < target.len() && base[j + n] == target[i + n] {
-                    n += 1;
-                }
-                append_insert(&mut out, &target[pending..i]);
-                append_copy(&mut out, j, n);
-                i += n;
-                pending = i;
-                if i + DELTA_BLOCK <= target.len() {
-                    h = hash(&target[i..]);
-                }
-                continue;
+        if let Some(&j0) = at.get(&h)
+            && base[j0..j0 + DELTA_BLOCK] == target[i..i + DELTA_BLOCK]
+        {
+            let mut j = j0;
+            while j > 0 && i > pending && base[j - 1] == target[i - 1] {
+                i -= 1;
+                j -= 1;
             }
+            let mut n = DELTA_BLOCK;
+            while j + n < base.len() && i + n < target.len() && base[j + n] == target[i + n] {
+                n += 1;
+            }
+            append_insert(&mut out, &target[pending..i]);
+            append_copy(&mut out, j, n);
+            i += n;
+            pending = i;
+            if i + DELTA_BLOCK <= target.len() {
+                h = hash(&target[i..]);
+            }
+            continue;
         }
         if i + DELTA_BLOCK < target.len() {
-            h = h.wrapping_sub((target[i] as u32).wrapping_mul(pow)).wrapping_mul(PRIME).wrapping_add(target[i + DELTA_BLOCK] as u32);
+            h = h
+                .wrapping_sub((target[i] as u32).wrapping_mul(pow))
+                .wrapping_mul(PRIME)
+                .wrapping_add(target[i + DELTA_BLOCK] as u32);
         }
         i += 1;
     }
@@ -973,9 +976,21 @@ mod tests {
 
     #[test]
     fn tree_json_matches_serde() {
-        let names = ["plain.txt", "a<b>&c", "quote\"back\\slash", "tab\tnl\n", "ünï", "line\u{2028}sep", "\u{7f}del", "\u{1}ctl"];
+        let names = [
+            "plain.txt",
+            "a<b>&c",
+            "quote\"back\\slash",
+            "tab\tnl\n",
+            "ünï",
+            "line\u{2028}sep",
+            "\u{7f}del",
+            "\u{1}ctl",
+        ];
         let t = Tree {
-            entries: names.iter().map(|n| Entry { name: n.to_string(), mode: Mode::Exec, id: hash_object("blob", n.as_bytes()) }).collect(),
+            entries: names
+                .iter()
+                .map(|n| Entry { name: n.to_string(), mode: Mode::Exec, id: hash_object("blob", n.as_bytes()) })
+                .collect(),
         };
         assert_eq!(crate::tree::tree_json(&t), crate::util::to_json(&t));
     }

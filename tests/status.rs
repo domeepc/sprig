@@ -160,9 +160,18 @@ fn checkout_touches_only_what_differs() {
         assert!(c.must(&["status"]).contains("clean"), "after checkout {branch}");
         same_as_full(&c, &format!("checkout {branch}"));
         assert_eq!(std::fs::metadata(c.path("d1")).unwrap().is_file(), want_d1_file);
-        assert_eq!(c.repo().change_flat(&c.head()).unwrap().len(), std::fs::read_dir(c.path("d0")).unwrap().count() + std::fs::read_dir(c.path("d2")).unwrap().count() + if want_d1_file { 1 } else { 10 });
+        assert_eq!(
+            c.repo().change_flat(&c.head()).unwrap().len(),
+            std::fs::read_dir(c.path("d0")).unwrap().count()
+                + std::fs::read_dir(c.path("d2")).unwrap().count()
+                + if want_d1_file { 1 } else { 10 }
+        );
     }
-    assert_eq!(std::fs::metadata(c.path("d0/f3.txt")).unwrap().modified().unwrap(), untouched, "an unchanged file was rewritten");
+    assert_eq!(
+        std::fs::metadata(c.path("d0/f3.txt")).unwrap().modified().unwrap(),
+        untouched,
+        "an unchanged file was rewritten"
+    );
     // uncommitted work is never overwritten without -f; with -f it is, and untracked files go
     c.write("d0/f0.txt", "dirty\n");
     c.write("untracked.txt", "u\n");
@@ -225,7 +234,10 @@ fn watcher_fast_path_matches_full() {
     std::fs::remove_dir_all(c.path("d3")).unwrap();
     check("delete directory");
     let out = c.must(&["status"]);
-    assert!(out.contains("D d2/f2.txt") && out.contains("A newdir/a/b.txt") && out.contains("R d0/f0.txt -> d0/g0.txt"), "{out}");
+    assert!(
+        out.contains("D d2/f2.txt") && out.contains("A newdir/a/b.txt") && out.contains("R d0/f0.txt -> d0/g0.txt"),
+        "{out}"
+    );
     // what counts as a file changed: the watcher can't vouch, everything is looked at
     c.write(".sprigignore", "newdir\n");
     std::thread::sleep(Duration::from_millis(150));

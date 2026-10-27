@@ -18,8 +18,8 @@ const WATCH_SLACK: i64 = 1_000_000_000;
 #[cfg(unix)]
 mod imp {
     use super::WATCH_SLACK;
-    use crate::store::{hash_object, Repo};
-    use crate::util::{now_ns, Result};
+    use crate::store::{Repo, hash_object};
+    use crate::util::{Result, now_ns};
     use crate::{bail, err};
     use notify::{EventKind, RecursiveMode, Watcher};
     use std::collections::HashMap;
@@ -27,7 +27,7 @@ mod imp {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     /// The watcher's socket: in .sprig, or, when that path is too long for a
@@ -42,10 +42,10 @@ mod imp {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let dir = std::env::temp_dir().join(format!("sprig-{uid}"));
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e.into());
-            }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(e.into());
         }
         let st = std::fs::symlink_metadata(&dir)?;
         if !st.is_dir() || st.permissions().mode() & 0o777 != 0o700 || st.uid() != uid {
@@ -124,7 +124,8 @@ mod imp {
                             s.since = now;
                         }
                     }
-                    if matches!(ev.kind, EventKind::Create(_)) && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+                    if matches!(ev.kind, EventKind::Create(_)) && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+                    {
                         // files created before the watch was added are covered: the client walks this dir
                         add_tree(&mut w, p, &st2);
                     }
@@ -205,7 +206,7 @@ mod imp {
             }
             match l.trim_end_matches('\n') {
                 ".sprigignore" => return (vec![], false, true), // what counts as a file changed: look at everything
-                "." => dirty.push(String::new()),                // the root
+                "." => dirty.push(String::new()),               // the root
                 p => dirty.push(p.to_string()),
             }
         }

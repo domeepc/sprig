@@ -3,10 +3,10 @@
 use crate::diff::{is_binary, split_lines, unified_diff};
 use crate::merge::CommitOpts;
 use crate::remote::Remote;
-use crate::server::{parse_scopes, serve, Server};
-use crate::sign::{check_sig, Signature};
-use crate::store::{short, valid_path, valid_ref_name, Change, Meta, Repo};
-use crate::tree::{apply_deltas, diff_flat, Delta, FileEnt, RENAME_THRESHOLD};
+use crate::server::{Server, parse_scopes, serve};
+use crate::sign::{Signature, check_sig};
+use crate::store::{Change, Meta, Repo, short, valid_path, valid_ref_name};
+use crate::tree::{Delta, FileEnt, RENAME_THRESHOLD, apply_deltas, diff_flat};
 use crate::util::{self, Error, Result};
 use crate::{bail, err};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -196,7 +196,7 @@ fn meta_of(f: &Flags) -> Result<Meta> {
     })
 }
 
-fn with<'a>(a: &[(&'static str, Kind)], b: &[(&'static str, Kind)]) -> Vec<(&'static str, Kind)> {
+fn with(a: &[(&'static str, Kind)], b: &[(&'static str, Kind)]) -> Vec<(&'static str, Kind)> {
     a.iter().chain(b).copied().collect()
 }
 
@@ -362,7 +362,9 @@ fn cmd_commit(r: &Repo, args: &[String], out: Out) -> Result<()> {
         }
         for h in f.multi("hunk") {
             let (p, n) = match h.rsplit_once(':') {
-                Some((p, n)) if !p.is_empty() => (p, n.parse::<usize>().map_err(|_| err!("bad --hunk {h:?} (want path:N)"))?),
+                Some((p, n)) if !p.is_empty() => {
+                    (p, n.parse::<usize>().map_err(|_| err!("bad --hunk {h:?} (want path:N)"))?)
+                }
                 _ => bail!("bad --hunk {h:?} (want path:N)"),
             };
             let p = p.trim_matches('/').to_string();
@@ -379,10 +381,10 @@ fn cmd_commit(r: &Repo, args: &[String], out: Out) -> Result<()> {
     };
     let (rf, _) = r.head();
     writeln!(out, "[{} {}] {}", rf.trim_start_matches("heads/"), short(&id), first_line(&msg))?;
-    if let Ok(c) = r.get_change(&id) {
-        if !c.conflicts.is_empty() {
-            writeln!(out, "warning: {} unresolved conflict(s) carried forward (see `sprig conflicts`)", c.conflicts.len())?;
-        }
+    if let Ok(c) = r.get_change(&id)
+        && !c.conflicts.is_empty()
+    {
+        writeln!(out, "warning: {} unresolved conflict(s) carried forward (see `sprig conflicts`)", c.conflicts.len())?;
     }
     Ok(())
 }
@@ -488,7 +490,8 @@ fn print_change_header(r: &Repo, out: Out, id: &str, c: &Change, sigs: bool) -> 
 }
 
 fn cmd_log(r: &Repo, args: &[String], out: Out) -> Result<()> {
-    let f = parse(&[("n", Kind::Value), ("agent", Kind::Value), ("json", Kind::Bool), ("signatures", Kind::Bool)], args)?;
+    let f =
+        parse(&[("n", Kind::Value), ("agent", Kind::Value), ("json", Kind::Bool), ("signatures", Kind::Bool)], args)?;
     let n = f.int("n", 20)?.max(0) as usize;
     let agent = f.str("agent", "");
     let start = r.resolve_rev(if f.args.is_empty() { "HEAD" } else { f.arg(0) })?;
@@ -595,10 +598,10 @@ fn cmd_branch(r: &Repo, args: &[String], out: Out) -> Result<()> {
         let (cur, _) = r.head();
         let mut names: Vec<String> =
             r.list_refs().keys().filter_map(|n| n.strip_prefix("heads/")).map(String::from).collect();
-        if let Some(c) = cur.strip_prefix("heads/") {
-            if !names.iter().any(|n| n == c) {
-                names.push(c.to_string());
-            }
+        if let Some(c) = cur.strip_prefix("heads/")
+            && !names.iter().any(|n| n == c)
+        {
+            names.push(c.to_string());
         }
         names.sort();
         for n in names {
@@ -661,7 +664,10 @@ fn cmd_merge(r: &Repo, args: &[String], out: Out) -> Result<()> {
             writeln!(out, "CONFLICT {}", c.path)?;
         }
         if !res.conflicts.is_empty() {
-            writeln!(out, "conflicts are recorded in the change; edit the files (or `sprig resolve --ours/--theirs`) and commit")?;
+            writeln!(
+                out,
+                "conflicts are recorded in the change; edit the files (or `sprig resolve --ours/--theirs`) and commit"
+            )?;
         }
     }
     if !res.conflicts.is_empty() {

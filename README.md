@@ -374,44 +374,76 @@ bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 directory, 100 commits of 3-file edits, imported into sprig and packed with
 `gc`), runs each command 20 times with a clean `HOME`, and writes
 `bench/results.csv`; `bench/chart.py` (Python standard library only) draws
-the charts. Linux, 12 cores, warm disk cache, average wall time.
+the charts. Run on a 4-core Linux VM with costly system calls (git itself is
+about 2x slower here than on the 12-core machine of earlier numbers), warm
+disk cache, average wall time. The previous Go build was measured in the
+same runs (`bench/results-go.csv`).
 
 ![git vs sprig at 3,000 files](bench/at-3000.svg)
 
 ![each command against repo size, 1k to 30k files](bench/scaling.svg)
 
-| Command | 1k files git / sprig | 3k | 10k | 30k |
+| Command | 1k files: git / sprig (Go before) | 3k | 10k | 30k |
 |---|---|---|---|---|
-| starting the program (`version`) | 1.2 / 2.5 | 1.2 / 2.4 | 1.2 / 2.3 | 1.2 / 2.4 |
-| `status` (clean) | 3.4 / 4.2 | 3.9 / 5.9 | 7.4 / 12.0 | 18.1 / 34.8 |
-| `status`, `sprig watch` running | 3.3 / **3.0** | 4.0 / **3.0** | 7.7 / **3.0** | 19.5 / **3.6** |
-| `status` (1 modified) | 3.3 / 4.8 | 4.0 / 7.4 | 7.9 / 17.1 | 18.0 / 43.7 |
-| `diff` (working tree) | 2.6 / 5.2 | 2.7 / 8.1 | 4.3 / 20.0 | 9.7 / 52.8 |
-| `log -n 100` | 3.6 / 4.0 | 3.6 / 4.0 | 3.4 / 4.1 | 2.9 / 4.5 |
-| `show HEAD~10` | 2.4 / 4.0 | 2.3 / 4.2 | 2.3 / 4.8 | 2.4 / 6.6 |
-| `diff HEAD~50 HEAD` | 10.4 / **7.8** | 10.5 / **7.6** | 7.3 / 8.1 | 6.9 / 9.4 |
-| `checkout` (50 commits back) | 11.3 / 11.8 | 12.2 / 19.3 | 15.8 / 47.4 | 27.8 / 135 |
-| `commit` (one file) | 6.3 / 7.7 | 9.3 / 11.0 | 11.3 / 25.2 | 21.6 / 75.0 |
-| storage after gc (KB) | 424 / **404** | 800 / 928 | 2,120 / 2,764 | 5,936 / 8,132 |
+| starting the program (`version`) | 2.3 / **2.2** (5.5) | 2.2 / 2.6 (5.5) | 2.9 / **2.6** (5.3) | 2.2 / **2.1** (6.2) |
+| `status` (clean) | 4.9 / **4.4** (11.0) | 9.7 / **6.2** (13.1) | 17.1 / **12.0** (28.2) | 33.2 / **22.3** (82.8) |
+| `status`, `sprig watch` running | 5.4 / **3.1** (9.0) | 8.2 / **3.5** (9.7) | 16.3 / **3.8** (8.0) | 40.1 / **3.9** (9.6) |
+| `status` (1 modified) | 5.9 / 6.6 (13.6) | 7.5 / 7.6 (16.8) | 17.2 / **15.7** (38.1) | 38.2 / **28.2** (93.0) |
+| `diff` (working tree) | 4.2 / 7.0 (13.2) | 7.1 / 7.6 (18.3) | 9.8 / 13.2 (36.4) | 20.7 / 23.3 (130.6) |
+| `log -n 100` | 5.3 / **3.7** (7.8) | 5.2 / **4.1** (7.8) | 6.4 / **5.4** (8.0) | 5.7 / **5.5** (9.9) |
+| `show HEAD~10` | 3.2 / 3.3 (7.7) | 3.9 / 4.5 (8.7) | 4.1 / **3.7** (9.9) | 3.8 / 4.4 (13.1) |
+| `diff HEAD~50 HEAD` | 14.7 / **6.3** (15.2) | 18.4 / **7.5** (13.5) | 13.6 / **8.2** (13.4) | 11.7 / **9.8** (17.9) |
+| `checkout` (50 commits back) | 67.1 / **34.2** (51.0) | 29.5 / 35.5 (60.7) | 78.9 / **46.7** (132.9) | 96.9 / **67.4** (369.9) |
+| `commit` (one file) | 14.1 / **11.2** (20.6) | 16.2 / **10.8** (31.7) | 26.7 / **18.0** (63.0) | 51.8 / **38.5** (180.5) |
+| storage after gc (KB) | 472 / **384** (424) | 848 / **840** (948) | 2,168 / 2,436 (2,784) | 5,924 / 7,084 (8,152) |
 
-(ms unless noted; bold where sprig wins.)
+(ms unless noted; bold where sprig beats git. This VM is noisy: single
+numbers can be off by 20% or more, e.g. git's `checkout` at 1k.)
 
 What this shows:
 
-- **Startup costs ~1.2 ms more than git** at every size: Go's runtime
-  (~0.3 ms), linking tree-sitter through cgo with a dynamic libc (~0.3 ms) and
-  package initialisation (~0.6 ms). On small repos that is most of the gap.
-- **With `sprig watch`, `status` stays at ~3 ms at any size**, because it
-  only checks the files the watcher saw change, while git stats every file
-  (5x faster than git at 30k files).
-- **Without the watcher, sprig falls behind as repos grow.** `status`,
-  working-tree `diff`, `checkout` and `commit` all walk or rewrite more of the
-  tree than git does; at 30k files they are 2-5x slower. git's index keeps
-  the whole tree flat and sorted in one mmap'd file; sprig loads a stat
-  cache and rebuilds tree objects per directory.
-- **History commands are close to git** and grow slowly with size; diffs
-  between commits skip identical directories and win at small sizes.
-- **Storage is about git's at 1k files and ~1.4x at 30k.**
+- **The Rust build is 2-10x faster than the Go build** on everything that
+  touches the working tree, and starts in the same time as git (~2 ms;
+  Go's runtime and cgo cost ~3 ms here).
+- **`status`, `commit` and `checkout` now beat git** at 10k-30k files: the
+  index answers "what changed?" from one mmap'd file, and each command only
+  does work for the paths that changed (see `PLAN-speed.md`).
+- **With `sprig watch`, `status` stays at ~3-4 ms at any size** (10x faster
+  than git at 30k files), because only the files the watcher saw change are
+  looked at.
+- **Working-tree `diff` and `show` are about even with git**; the remaining
+  gap is reading and hashing the changed files and starting the walk.
+- **Storage is smaller than git's up to a few thousand files and ~1.2x at
+  30k** (it was ~1.4x with the Go build).
+
+## Dependencies
+
+Direct dependencies, each the standard crate for its job:
+
+| Crate | For |
+|---|---|
+| `sha2`, `ed25519-dalek` (RustCrypto, dalek-cryptography) | object ids, change signatures |
+| `flate2`, `zstd` | loose objects (zlib), packs (zstd) |
+| `serde`, `serde_json`, `base64` | JSON objects and API |
+| `tree-sitter` + Go, Python, JavaScript, TypeScript, Rust, Java grammars | code-aware merge |
+| `tiny_http`, `ureq` (rustls) | server, client |
+| `notify` | `sprig watch` |
+| `memmap2`, `libc`, `getrandom` | mmap of packs and the index, local time, randomness |
+
+All are pinned in `Cargo.lock` (82 crates in the build, 114 counting other
+platforms). Checked before release:
+
+- `cargo audit` against the RustSec advisory database: no vulnerabilities,
+  no unmaintained or yanked crates.
+- Every crate with a build script was looked at: they compile the C of
+  tree-sitter grammars, zstd and ring, generate bindings, or check the
+  compiler version; none fetches anything.
+- No crate name is a look-alike of a popular one; all come from the
+  projects' own maintainers (rust-lang, RustCrypto, tree-sitter, dtolnay,
+  algesten, notify-rs, ...).
+
+Re-check after changing dependencies with `cargo install cargo-audit` and
+`cargo audit`.
 
 ## Not done (yet)
 
@@ -426,12 +458,6 @@ What this shows:
   read-scoped token walks the whole history; later ones only project new
   changes. Caches pass such tokens' requests to the main server, and a read
   scope can't be widened for an existing clone (clone again).
-- **Small commands start ~1 ms behind git.** That is Go's runtime, cgo and
-  package initialisation; a statically linked build (needs a static libc,
-  e.g. `glibc-static`) would trim part of it.
-- **Large working trees are slower than git without `sprig watch`.** At 30k
-  files `status` is 2x, `commit` 3.5x and `checkout` 5x git's time (see
-  Measured); run `sprig watch` for status, the rest needs an index like git's.
 - **Loose objects use a file each** until gc runs. Auto gc starts at about
   6,400 of them (estimated, as git does), so a busy server holds up to that
   many loose files between runs.

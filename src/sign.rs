@@ -4,11 +4,11 @@
 //! keeps that request as the proof; verifying checks the signature and that
 //! the change touched nothing but the signed paths.
 
-use crate::store::{short, Change, Meta, Repo};
+use crate::store::{Change, Meta, Repo, short};
 use crate::tree::diff_flat;
 use crate::util::{self, Result};
 use crate::{bail, err};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -145,7 +145,10 @@ impl Repo {
     /// saying why the change is not validly signed.
     pub fn verify_change(&self, c: &Change) -> Result<String, (String, crate::util::Error)> {
         if !c.projected.is_empty() {
-            return Err((String::new(), err!("projected from {}; verify that change on the server", short(&c.projected))));
+            return Err((
+                String::new(),
+                err!("projected from {}; verify that change on the server", short(&c.projected)),
+            ));
         }
         let Some(sig) = &c.sig else { return Err((String::new(), err!("unsigned"))) };
         let key = sig.key.clone();

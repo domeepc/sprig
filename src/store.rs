@@ -4,9 +4,9 @@
 use crate::pack::{ObjCache, PackSet};
 use crate::remote::Remote;
 use crate::sign::Signature;
-use crate::util::{self, hex, nullable, Error, IoContext, Result};
+use crate::util::{self, Error, IoContext, Result, hex, nullable};
 use crate::{bail, err};
-use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -147,7 +147,12 @@ pub struct Config {
     #[serde(default, deserialize_with = "nullable", skip_serializing_if = "Vec::is_empty")]
     pub sparse: Vec<String>,
     /// signing key -> who it belongs to
-    #[serde(default, rename = "trusted_keys", deserialize_with = "nullable", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        rename = "trusted_keys",
+        deserialize_with = "nullable",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub trusted: BTreeMap<String, String>,
 }
 
@@ -189,11 +194,7 @@ impl Repo {
     }
 
     pub fn init(root: &Path, bare: bool, branch: &str) -> Result<Repo> {
-        let r = if bare {
-            Repo::bare_at(root)
-        } else {
-            Repo::at(root.to_path_buf(), root.join(".sprig"), false)
-        };
+        let r = if bare { Repo::bare_at(root) } else { Repo::at(root.to_path_buf(), root.join(".sprig"), false) };
         if r.dir.join("objects").exists() {
             bail!("repository already exists in {}", r.dir.display());
         }
@@ -292,7 +293,7 @@ impl Repo {
         let f = match fs::File::open(&p) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound(format!("object {} not found", short(id))))
+                return Err(Error::NotFound(format!("object {} not found", short(id))));
             }
             Err(e) => return Err(e.into()),
         };
@@ -376,10 +377,10 @@ impl Repo {
                 let full = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
                     walk(r, &e.path(), &full, out);
-                } else if !name.starts_with(".tmp-") {
-                    if let Some(id) = r.read_ref(&full) {
-                        out.insert(full, id);
-                    }
+                } else if !name.starts_with(".tmp-")
+                    && let Some(id) = r.read_ref(&full)
+                {
+                    out.insert(full, id);
                 }
             }
         }
@@ -420,11 +421,7 @@ impl Repo {
 
     pub fn advance_head(&self, id: &str) -> Result<()> {
         let (r, _) = self.head();
-        if r.is_empty() {
-            self.set_head_detached(id)
-        } else {
-            self.write_ref(&r, id)
-        }
+        if r.is_empty() { self.set_head_detached(id) } else { self.write_ref(&r, id) }
     }
 
     // -----------------------------------------------------------------------
@@ -516,11 +513,7 @@ impl Repo {
         let mut steps = 0;
         if let Some(i) = s.rfind('~') {
             let rest = &s[i + 1..];
-            steps = if rest.is_empty() {
-                1
-            } else {
-                leading_int(rest).ok_or_else(|| err!("bad revision {s:?}"))?
-            };
+            steps = if rest.is_empty() { 1 } else { leading_int(rest).ok_or_else(|| err!("bad revision {s:?}"))? };
             s = &s[..i];
         }
         let mut id = self.resolve_base(s)?;
@@ -563,10 +556,8 @@ impl Repo {
                     }
                 }
             }
-            let mut found: Vec<String> = cands
-                .into_iter()
-                .filter(|id| matches!(self.get_object(id), Ok((CHANGE, _))))
-                .collect();
+            let mut found: Vec<String> =
+                cands.into_iter().filter(|id| matches!(self.get_object(id), Ok((CHANGE, _)))).collect();
             found.sort();
             found.dedup();
             match found.len() {
@@ -598,10 +589,10 @@ fn leading_int(s: &str) -> Option<usize> {
 }
 
 pub fn author_from(c: &Config) -> String {
-    if let Ok(a) = std::env::var("SPRIG_AUTHOR") {
-        if !a.is_empty() {
-            return a;
-        }
+    if let Ok(a) = std::env::var("SPRIG_AUTHOR")
+        && !a.is_empty()
+    {
+        return a;
     }
     if !c.author.is_empty() {
         return c.author.clone();

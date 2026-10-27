@@ -35,7 +35,9 @@ fn lang_for(path: &str) -> Option<Lang> {
         "go" => l(tree_sitter_go::LANGUAGE.into(), comments, go_key, go_body, "\n\n"),
         "py" => l(tree_sitter_python::LANGUAGE.into(), comments, py_key, py_body, "\n\n\n"),
         "js" | "mjs" | "cjs" | "jsx" => l(tree_sitter_javascript::LANGUAGE.into(), comments, js_key, js_body, "\n\n"),
-        "ts" | "mts" | "cts" => l(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), comments, js_key, js_body, "\n\n"),
+        "ts" | "mts" | "cts" => {
+            l(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), comments, js_key, js_body, "\n\n")
+        }
         "tsx" => l(tree_sitter_typescript::LANGUAGE_TSX.into(), comments, js_key, js_body, "\n\n"),
         "rs" => l(
             tree_sitter_rust::LANGUAGE.into(),
@@ -163,7 +165,8 @@ fn js_key(n: Node, src: &str) -> String {
             let mut prefix = vec![]; // get/set/static make different members with the same name
             for i in 0..n.child_count() {
                 let c = n.child(i).unwrap();
-                if matches!(c.kind(), "property_identifier" | "private_property_identifier" | "computed_property_name") {
+                if matches!(c.kind(), "property_identifier" | "private_property_identifier" | "computed_property_name")
+                {
                     return format!("method {} {}", prefix.join(" "), text(Some(c), src));
                 }
                 if !c.is_named() {
@@ -191,13 +194,21 @@ fn js_body(n: Node) -> Option<Node> {
 
 fn rs_key(n: Node, src: &str) -> String {
     match n.kind() {
-        k @ ("function_item" | "function_signature_item" | "struct_item" | "enum_item" | "union_item" | "trait_item"
-        | "type_item" | "const_item" | "static_item" | "mod_item" | "macro_definition" | "associated_type") => {
-            match named(n, "name", src) {
-                "" => String::new(),
-                name => format!("{k} {name}"),
-            }
-        }
+        k @ ("function_item"
+        | "function_signature_item"
+        | "struct_item"
+        | "enum_item"
+        | "union_item"
+        | "trait_item"
+        | "type_item"
+        | "const_item"
+        | "static_item"
+        | "mod_item"
+        | "macro_definition"
+        | "associated_type") => match named(n, "name", src) {
+            "" => String::new(),
+            name => format!("{k} {name}"),
+        },
         "impl_item" => {
             let mut key = format!("impl {}", squash(named(n, "type", src)));
             let tr = named(n, "trait", src);
@@ -219,7 +230,10 @@ fn rs_body(n: Node) -> Option<Node> {
 
 fn java_key(n: Node, src: &str) -> String {
     match n.kind() {
-        k @ ("class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
+        k @ ("class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
         | "annotation_type_declaration") => format!("{k} {}", named(n, "name", src)),
         "method_declaration" => format!("method {}{}", named(n, "name", src), squash(named(n, "parameters", src))),
         "constructor_declaration" => format!("ctor {}", squash(named(n, "parameters", src))),
@@ -402,7 +416,13 @@ impl Lang {
                 // members' default separator: as in ours, else a blank line at ours' indent
                 let first = body.named_child(0).unwrap().start_byte();
                 let indent = first - src[..first].rfind('\n').map_or(0, |i| i + 1);
-                gap = s.units.order.first().and_then(|k| s.units.gap.get(k)).cloned().unwrap_or(format!("\n\n{}", " ".repeat(indent)));
+                gap = s
+                    .units
+                    .order
+                    .first()
+                    .and_then(|k| s.units.gap.get(k))
+                    .cloned()
+                    .unwrap_or(format!("\n\n{}", " ".repeat(indent)));
             }
             sides.push(s);
         }
@@ -503,7 +523,9 @@ mod tests {
         let theirs = "package x\n\nimport (\n\t\"os\"\n\t\"strings\"\n)\n\n// A says hi.\nfunc A() string { return strings.ToUpper(\"a\") }\n\nfunc B() int { return len(os.Args) }\n\nfunc D() {}\n";
         assert!(line_conflicts(base, ours, theirs) > 0, "test needs a case the line merge cannot do");
         let got = cm("x.go", base, ours, theirs).expect("Go-aware merge gave up");
-        for want in ["\"fmt\"", "\"os\"", "\"strings\"", "fmt.Sprint(", "len(os.Args)", "func C()", "func D()", "// A says hi."] {
+        for want in
+            ["\"fmt\"", "\"os\"", "\"strings\"", "fmt.Sprint(", "len(os.Args)", "func C()", "func D()", "// A says hi."]
+        {
             assert!(got.contains(want), "merged file lacks {want}:\n{got}");
         }
         assert_eq!(got.matches("\"strings\"").count(), 1, "{got}");
@@ -514,40 +536,55 @@ mod tests {
     #[test]
     fn tree_sitter_merge() {
         let cases: &[(&str, &str, &str, &str, &[&str])] = &[
-            ("m.py",
+            (
+                "m.py",
                 "import os\n\n\ndef a():\n    return 1\n",
                 "import os\nimport sys\n\n\ndef a():\n    return 1\n\n\ndef b():\n    return sys.argv\n",
                 "import os\nimport json\n\n\ndef a():\n    return 1\n\n\ndef c():\n    return json.dumps({})\n",
-                &["import sys", "import json", "def b()", "def c()"]),
-            ("m.js",
+                &["import sys", "import json", "def b()", "def c()"],
+            ),
+            (
+                "m.js",
                 "import a from 'a';\n\nfunction one() { return 1; }\n",
                 "import a from 'a';\nimport b from 'b';\n\nfunction one() { return 1; }\n\nfunction two() { return b; }\n",
                 "import a from 'a';\nimport c from 'c';\n\nfunction one() { return 1; }\n\nexport const three = c;\n",
-                &["import b from 'b'", "import c from 'c'", "function two()", "export const three"]),
-            ("m.ts",
+                &["import b from 'b'", "import c from 'c'", "function two()", "export const three"],
+            ),
+            (
+                "m.ts",
                 "export interface A { x: number }\n",
                 "export interface A { x: number }\n\nexport type B = string;\n",
                 "export interface A { x: number }\n\nexport function c(): number { return 1; }\n",
-                &["type B", "function c()"]),
-            ("m.rs",
+                &["type B", "function c()"],
+            ),
+            (
+                "m.rs",
                 "use std::io;\n\nfn a() {}\n",
                 "use std::io;\nuse std::fs;\n\nfn a() {}\n\nfn b() {}\n",
                 "use std::io;\nuse std::env;\n\nfn a() {}\n\n#[test]\nfn c() {}\n",
-                &["use std::fs;", "use std::env;", "fn b()", "#[test]\nfn c()"]),
-            ("M.java",
+                &["use std::fs;", "use std::env;", "fn b()", "#[test]\nfn c()"],
+            ),
+            (
+                "M.java",
                 "package p;\n\nimport java.util.List;\n\nclass M {\n    int a() { return 1; }\n}\n",
                 "package p;\n\nimport java.util.List;\nimport java.util.Map;\n\nclass M {\n    int a() { return 1; }\n\n    int b() { return 2; }\n}\n",
                 "package p;\n\nimport java.util.List;\nimport java.util.Set;\n\nclass M {\n    int a() { return 1; }\n\n    int c() { return 3; }\n}\n",
-                &["import java.util.Map;", "import java.util.Set;", "int b()", "int c()"]),
-            ("k.py", // members of one class, changed on both sides
+                &["import java.util.Map;", "import java.util.Set;", "int b()", "int c()"],
+            ),
+            (
+                "k.py", // members of one class, changed on both sides
                 "class K:\n    def a(self):\n        return 1\n\n    def b(self):\n        return 2\n",
                 "class K:\n    def a(self):\n        return 10\n\n    def b(self):\n        return 2\n",
                 "class K:\n    def a(self):\n        return 1\n\n    def b(self):\n        return 20\n\n    def c(self):\n        return 3\n",
-                &["return 10", "return 20", "def c(self)"]),
+                &["return 10", "return 20", "def c(self)"],
+            ),
         ];
         for (file, base, ours, theirs, want) in cases {
             let Some(got) = cm(file, base, ours, theirs) else {
-                panic!("{file}: structural merge gave up (line merge conflicts: {})", line_conflicts(base, ours, theirs));
+                panic!(
+                    "{file}: structural merge gave up (line merge conflicts: {})",
+                    line_conflicts(base, ours, theirs)
+                );
             };
             for w in *want {
                 assert!(got.contains(w), "{file}: result lacks {w:?}:\n{got}");

@@ -15,10 +15,10 @@
 //! --follow`) uses it to mirror another server.
 
 use crate::pack::MAX_OBJECT_SIZE;
-use crate::project::{scope_key, Projection};
-use crate::remote::{read_records, write_record, LandRequest, LandResult, RefUpdate, Remote, BATCH_BYTES, BATCH_IDS};
-use crate::sign::{check_sig, LandProof, Signature};
-use crate::store::{children, hash_object, is_id, short, valid_path, valid_ref_name, Change, Repo, BLOB};
+use crate::project::{Projection, scope_key};
+use crate::remote::{BATCH_BYTES, BATCH_IDS, LandRequest, LandResult, RefUpdate, Remote, read_records, write_record};
+use crate::sign::{LandProof, Signature, check_sig};
+use crate::store::{BLOB, Change, Repo, children, hash_object, is_id, short, valid_path, valid_ref_name};
 use crate::tree::{FileEnt, Flat, Mode};
 use crate::util::{self, Error, Result};
 use crate::{bail, err};
@@ -290,9 +290,8 @@ impl Server {
         let url = req.url().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         let path = percent_decode(path, false);
-        let header = |k: &'static str| {
-            req.headers().iter().find(|h| h.field.equiv(k)).map(|h| h.value.as_str().to_string())
-        };
+        let header =
+            |k: &'static str| req.headers().iter().find(|h| h.field.equiv(k)).map(|h| h.value.as_str().to_string());
         let limit = match path.as_str() {
             "/v1/objects/missing" | "/v1/objects/get" => 8 << 20,
             "/v1/objects/put" => BATCH_BYTES + MAX_OBJECT_SIZE,
@@ -399,7 +398,9 @@ impl Server {
         match up.send(&r.method, path, &r.body, &hdr) {
             Ok(resp) => {
                 let mut headers = vec![];
-                for (k, v) in [("Content-Type", resp.content_type), ("X-Sprig-Type", resp.typ), ("X-Sprig-Mode", resp.mode)] {
+                for (k, v) in
+                    [("Content-Type", resp.content_type), ("X-Sprig-Type", resp.typ), ("X-Sprig-Mode", resp.mode)]
+                {
                     if !v.is_empty() {
                         headers.push((k, v));
                     }
@@ -417,7 +418,11 @@ impl Server {
     fn view_of(&self, r: &Req) -> Option<Arc<Mutex<Projection>>> {
         let read = r.scope.as_ref()?.read.as_ref()?;
         let mut m = self.projections.lock().unwrap();
-        Some(m.entry(scope_key(read)).or_insert_with(|| Arc::new(Mutex::new(Projection::load(&self.repo, read)))).clone())
+        Some(
+            m.entry(scope_key(read))
+                .or_insert_with(|| Arc::new(Mutex::new(Projection::load(&self.repo, read))))
+                .clone(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -446,7 +451,9 @@ impl Server {
                 // other processes sharing the repo don't notify us: poll too
                 let g = self.refs_gen.lock().unwrap();
                 let seen = *g;
-                let _ = self.refs_cv.wait_timeout_while(g, Duration::from_millis(250), |g| *g == seen && !self.is_stopped());
+                let _ = self
+                    .refs_cv
+                    .wait_timeout_while(g, Duration::from_millis(250), |g| *g == seen && !self.is_stopped());
                 refs = self.list_refs_for(r);
                 etag = refs_etag(&refs);
             }
@@ -483,7 +490,13 @@ impl Server {
             if let Err(e) = self.repo.delete_ref(name) {
                 return http_err(500, e);
             }
-            self.log_ref(ReflogEntry { reference: name.into(), old: cur, via: "delete".into(), who: r.token_kind().into(), ..Default::default() });
+            self.log_ref(ReflogEntry {
+                reference: name.into(),
+                old: cur,
+                via: "delete".into(),
+                who: r.token_kind().into(),
+                ..Default::default()
+            });
             return json(200, &serde_json::json!({ "ok": "deleted" }));
         }
         let c = match self.repo.get_change(&u.new) {
@@ -500,7 +513,10 @@ impl Server {
             }
             // Policy gate: unresolved merge conflicts may not land on a ref.
             if let Some(cf) = c.conflicts.first() {
-                return http_err(422, format!("tip change has {} unresolved conflict(s): {}", c.conflicts.len(), cf.path));
+                return http_err(
+                    422,
+                    format!("tip change has {} unresolved conflict(s): {}", c.conflicts.len(), cf.path),
+                );
             }
         }
         if let Err(e) = self.repo.write_ref(name, &u.new) {
@@ -552,7 +568,14 @@ impl Server {
             return Ok(true);
         }
         self.repo.write_ref(name, new)?;
-        self.log_ref(ReflogEntry { reference: name.into(), old: old.into(), new: new.into(), via: "land".into(), who: who.into(), ..Default::default() });
+        self.log_ref(ReflogEntry {
+            reference: name.into(),
+            old: old.into(),
+            new: new.into(),
+            via: "land".into(),
+            who: who.into(),
+            ..Default::default()
+        });
         Ok(false)
     }
 
@@ -622,12 +645,11 @@ impl Server {
 
     /// Copies an object from upstream into a cache server's store.
     fn fill(&self, id: &str) {
-        if let Some(up) = &self.upstream {
-            if !self.repo.has_object(id) {
-                if let Ok((typ, data)) = up.get_object(id) {
-                    let _ = self.repo.put_object(typ, &data); // hash-verified
-                }
-            }
+        if let Some(up) = &self.upstream
+            && !self.repo.has_object(id)
+            && let Ok((typ, data)) = up.get_object(id)
+        {
+            let _ = self.repo.put_object(typ, &data); // hash-verified
         }
     }
 
@@ -649,7 +671,9 @@ impl Server {
     fn check_object(&self, typ: &str, data: &[u8]) -> Option<String> {
         match children(typ, data) {
             Err(e) => Some(e.to_string()),
-            Ok(kids) => kids.iter().find(|k| !self.repo.has_object(k)).map(|k| format!("missing dependency {}", short(k))),
+            Ok(kids) => {
+                kids.iter().find(|k| !self.repo.has_object(k)).map(|k| format!("missing dependency {}", short(k)))
+            }
         }
     }
 
@@ -943,7 +967,8 @@ impl Server {
             let mut theirs = Flat::new();
             for p in u.files.keys() {
                 let te = self.repo.lookup(&tip_tree, p)?;
-                if te.as_ref().is_some_and(|e| e.mode == Mode::Dir) || base.get(p).is_some_and(|e| e.mode == Mode::Dir) {
+                if te.as_ref().is_some_and(|e| e.mode == Mode::Dir) || base.get(p).is_some_and(|e| e.mode == Mode::Dir)
+                {
                     return Ok(http_err(422, format!("path {p:?} is a directory")));
                 }
                 if let Some(te) = te {
@@ -955,8 +980,10 @@ impl Server {
             let mut paths: Vec<String> = u.files.keys().cloned().collect();
             let (mut b2, mut o2, mut t2) = (base.clone(), ours.clone(), theirs.clone());
             let mut moved = BTreeMap::new();
-            let gone: Vec<&String> =
-                paths.iter().filter(|p| base.contains_key(*p) && ours.contains_key(*p) && !theirs.contains_key(*p)).collect();
+            let gone: Vec<&String> = paths
+                .iter()
+                .filter(|p| base.contains_key(*p) && ours.contains_key(*p) && !theirs.contains_key(*p))
+                .collect();
             if !gone.is_empty() {
                 let bf = self.repo.flatten(&base_tree)?;
                 let tf = self.repo.flatten(&tip_tree)?;
@@ -991,7 +1018,8 @@ impl Server {
                         "conflicts": paths, "tip": tip }),
                 ));
             }
-            let edits: BTreeMap<String, Option<FileEnt>> = paths.iter().map(|p| (p.clone(), merged.get(p).cloned())).collect();
+            let edits: BTreeMap<String, Option<FileEnt>> =
+                paths.iter().map(|p| (p.clone(), merged.get(p).cloned())).collect();
             let tree = match self.repo.update_tree(&tip_tree, &edits) {
                 Ok(t) => t,
                 Err(e) => return Ok(http_err(422, e)),
@@ -1012,10 +1040,10 @@ impl Server {
                 ..Default::default()
             };
             let id = self.repo.put_change(&c)?;
-            if self.upstream.is_some() {
-                if let Err(e) = self.publish(&id, &tree, &edits) {
-                    return Ok(http_err(502, e));
-                }
+            if self.upstream.is_some()
+                && let Err(e) = self.publish(&id, &tree, &edits)
+            {
+                return Ok(http_err(502, e));
             }
             if self.swap_ref(&name, &tip, &id, &u.author)? {
                 continue; // someone landed meanwhile: re-merge onto the new tip

@@ -3,8 +3,8 @@
 
 use crate::pack::MAX_OBJECT_SIZE;
 use crate::sign::{self, LandProof, Signature};
-use crate::store::{children, hash_object, obj_type, short, Meta, Repo, TREE};
-use crate::tree::{apply_deltas, parse_tree, Mode};
+use crate::store::{Meta, Repo, TREE, children, hash_object, obj_type, short};
+use crate::tree::{Mode, apply_deltas, parse_tree};
 use crate::util::{self, Error, Result};
 use crate::{bail, err};
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct LandFile {
 }
 
 mod b64 {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -214,7 +214,10 @@ impl Remote {
             // sprig servers only send JSON or raw bytes
             return Err(Error::Remote {
                 code: r.status,
-                msg: format!("{} is not a sprig server; to publish to GitHub use `sprig export-git` and `git push`", self.base()),
+                msg: format!(
+                    "{} is not a sprig server; to publish to GitHub use `sprig export-git` and `git push`",
+                    self.base()
+                ),
             });
         }
         if r.status >= 300 {
@@ -291,7 +294,11 @@ impl Remote {
     }
 
     /// Downloads ids in batches, calling f for each (hash-verified).
-    pub fn get_objects(&self, ids: &[String], mut f: impl FnMut(&str, &'static str, Vec<u8>) -> Result<()>) -> Result<()> {
+    pub fn get_objects(
+        &self,
+        ids: &[String],
+        mut f: impl FnMut(&str, &'static str, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
         let mut ids = ids.to_vec();
         while !ids.is_empty() {
             let chunk = &ids[..ids.len().min(BATCH_IDS)];
@@ -311,7 +318,11 @@ impl Remote {
     }
 
     /// Uploads objects in dependency order, in batches.
-    pub fn put_objects(&self, ids: &[String], get: impl Fn(&str) -> Result<(&'static str, std::sync::Arc<[u8]>)>) -> Result<()> {
+    pub fn put_objects(
+        &self,
+        ids: &[String],
+        get: impl Fn(&str) -> Result<(&'static str, std::sync::Arc<[u8]>)>,
+    ) -> Result<()> {
         let mut buf = vec![];
         let flush = |buf: &mut Vec<u8>| -> Result<()> {
             if !buf.is_empty() {
