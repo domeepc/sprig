@@ -1,7 +1,8 @@
 [package]
 name = "sprig"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
 
 [dependencies]
 base64 = "0.23.1"
@@ -22,5 +23,5 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
-ureq = "3.5.0"
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 zstd = "0.14.3"

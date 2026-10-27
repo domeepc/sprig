@@ -5,48 +5,44 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 9,600 lines of Go plus 2,000 of tests. Dependencies outside
-the standard library: `fsnotify` (for `sprig watch`), `klauspost/compress`
-(zstd, for packs) and tree-sitter with its Python, JavaScript, TypeScript,
-Rust and Java grammars (for code-aware merge). All are pinned by hash in
-`go.sum`.
+Prototype, about 8,900 lines of Rust plus 1,800 of tests. It was first
+written in Go; the Rust version reads and writes the same repositories,
+packs and wire protocol (byte for byte: importing the same git history gives
+the same change ids). Dependencies are pinned in `Cargo.lock` and were
+checked with `cargo audit` (see [Dependencies](#dependencies)).
 
 ## Install
 
 You need:
 
-- **Go 1.26 or newer.** Check with `go version`. Older Go (1.21+) offers to
-  download 1.26 by itself; set `GOTOOLCHAIN=local` to refuse that and
-  install it yourself instead.
-- **A C compiler** (gcc or clang). Tree-sitter is C, so sprig builds with
-  cgo; `CGO_ENABLED=0` builds fail.
+- **Rust 1.89 or newer** (`rustc --version`), from rustup.rs or your
+  package manager.
+- **A C compiler** (gcc or clang). The tree-sitter grammars and zstd are C
+  and are compiled by cargo.
 - **git**, only for `import-git`/`export-git` and for fetching the source.
 
 | System | Command |
 |---|---|
-| Fedora / RHEL | `sudo dnf install golang gcc git` |
-| Debian / Ubuntu | `sudo apt install golang gcc git` (if its Go is older than 1.26, get Go from go.dev/dl) |
-| Arch | `sudo pacman -S go gcc git` |
-| macOS | `xcode-select --install` (clang and git), then `brew install go` |
-| Windows | Go from go.dev/dl, plus gcc from MSYS2 (`pacman -S mingw-w64-ucrt-x86_64-gcc`) on the PATH. Untested; `sprig watch` is Unix only. |
+| Fedora / RHEL | `sudo dnf install rust cargo gcc git` |
+| Debian / Ubuntu | `sudo apt install gcc git`, then Rust from rustup.rs (Debian's is often too old) |
+| Arch | `sudo pacman -S rust gcc git` |
+| macOS | `xcode-select --install` (clang and git), then `brew install rust` |
+| Windows | Rust from rustup.rs with the MSVC build tools. Untested; `sprig watch` is Unix only. |
 
 Build and put it on your PATH:
 
 ```sh
 git clone https://github.com/domeepc/sprig.git
 cd sprig
-go build -o sprig .
-install -m 755 sprig ~/.local/bin/    # or: sudo install -m 755 sprig /usr/local/bin/
+cargo install --locked --path .    # installs to ~/.cargo/bin
 sprig version
 ```
 
-(`go install github.com/...` does not work: the module is named `sprig`, not
-its GitHub path.) `~/.local/bin` must be on your PATH; if `sprig version`
-isn't found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or
-`~/.zshrc`.
+`~/.cargo/bin` must be on your PATH (rustup sets that up). To build without
+installing: `cargo build --release`, which leaves the binary in
+`target/release/sprig`.
 
-Check the build with `go test ./...`; one known failure,
-`TestServerRejectsBadObjects` (`a//b` path), is expected for now.
+Check the build with `cargo test --release`.
 
 Optional setup:
 
@@ -56,8 +52,8 @@ Optional setup:
 - `sprig watch` in a repo you work in a lot keeps `status` fast.
 - Running a server: see `sprig serve` under [Quick tour](#quick-tour).
 
-To update: `git pull && go build -o sprig . && install -m 755 sprig ~/.local/bin/`.
-To uninstall: delete the binary, and `~/.config/sprig` if you made a key.
+To update: `git pull && cargo install --locked --path .`.
+To uninstall: `cargo uninstall sprig`, and delete `~/.config/sprig` if you made a key.
 
 ## What's different from git
 
@@ -72,7 +68,7 @@ To uninstall: delete the binary, and `~/.config/sprig` if you made a key.
 | **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths, and `--hunk path:N` only some hunks of a file. |
 | **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read, including ones rebuilt from deltas in a pack. |
 | **Merges follow renames** | Renames are detected by content (`-M` sets the similarity, default 50%). When one side renames a file and the other edits it, the edit lands in the renamed file; files added to a directory the other side moved follow it. `land` does the same against renames that landed after your base. |
-| **Merges understand code** | When a line merge conflicts, sprig retries per import and per top-level declaration for Go (`go/parser`), Python, JavaScript/JSX, TypeScript/TSX, Rust and Java (tree-sitter), and per member inside a class, `impl` or Java type both sides changed. Two sides adding imports or functions merge cleanly; the same function changed both ways still conflicts. The result must parse without errors. |
+| **Merges understand code** | When a line merge conflicts, sprig retries per import and per top-level declaration for Go, Python, JavaScript/JSX, TypeScript/TSX, Rust and Java (tree-sitter), and per member inside a class, `impl` or Java type both sides changed. Two sides adding imports or functions merge cleanly; the same function changed both ways still conflicts. The result must parse without errors. |
 
 ## Quick tour
 
@@ -323,10 +319,16 @@ exist, or with `--repack`, gc merges them into one. Commands that add objects
 background when about 6,400 loose objects have piled up; `gc.lock` keeps runs
 from overlapping. Set `SPRIG_NO_AUTOGC=1` to turn that off.
 
-### Faster status with `sprig watch`
+### The index, and faster status with `sprig watch`
 
-`status` and `commit` normally `lstat` every file (in parallel) and only read
-the ones whose size or mtime changed. `sprig watch` runs in the background,
+`.sprig/index` is one sorted, mmap'd file (like git's index) that records,
+for every path, HEAD's entry and the working file's mode, content id, size
+and mtime as last seen. `status`, `diff`, `commit` and `checkout` `lstat`
+every file (in parallel), read only the ones whose stat changed, and compare
+the two halves of each record, so nothing is flattened or rebuilt: `diff`
+reads only the changed files (and stores nothing), `commit` stores only them
+and rewrites only the directories along their paths, and `checkout` writes
+only the paths that differ between the two trees. `sprig watch` runs in the background,
 watches the working tree with inotify/kqueue, and tells them which paths
 changed since the last check, so nothing else is touched. Without a running
 watcher, or when it can't vouch for the whole period (just started, event
@@ -343,32 +345,27 @@ overflow, `.sprigignore` changed), sprig falls back to the full walk. Set
 | `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
 | `SPRIG_NO_WATCH` | ignore a running `sprig watch` and walk the whole tree |
 | `SPRIG_NO_AUTOGC` | never start a background `gc --auto` |
-| `SPRIG_CPUPROFILE` | write a CPU profile of the command to this file |
 
 ## Layout
 
 ```
-store.go      objects, refs, HEAD, operation log, config, revision parsing
-tree.go       trees, flattening, working-tree snapshot/materialize, ignore
-diff.go       LCS line diff, unified diff, three-way merge
-merge.go      history walking, merge base, tree merge, commit/merge/checkout/undo
-server.go     HTTP API, landing, scoped tokens, cache tier, push/fetch client
-gitimport.go  git -> sprig converter (via `git cat-file --batch`)
-gitexport.go  sprig -> git converter (via `git fast-import`)
-batch.go      batched object transfer
-sign.go       ed25519 change signatures
-pack.go       packfiles (zstd, compact trees, deltas), gc, auto gc
-cache.go      per-process cache of decoded objects and trees
-statusfast.go status that only compares what may have changed
-astmerge.go   Go-aware merge (go/parser), shared unit merge
-langs.go      tree-sitter merge for Python, JS/TS, Rust, Java
-watch.go      `sprig watch` file watcher (fsnotify)
-follow.go     ref long-poll, caches following upstream, read-only standbys
-reflog.go     server ref log
-lock_*.go     ref lock per platform
-project.go    projected history for read-scoped tokens
-main.go       CLI
-bench/        git vs sprig benchmark (run.sh), charts (chart.py), results
+src/store.rs      objects, refs, HEAD, operation log, config, revision parsing
+src/tree.rs       trees, flat form, tree diffs, rename detection, writing files
+src/index.rs      the index and the working-tree scan (status in time proportional to change)
+src/diff.rs       LCS line diff, unified diff, three-way merge
+src/merge.rs      history walking, merge base, tree merge, commit/merge/checkout/undo
+src/pack.rs       packfiles (zstd, compact trees, deltas), object cache, gc, auto gc
+src/codemerge.rs  code-aware merge with tree-sitter (Go, Python, JS/TS, Rust, Java)
+src/server.rs     HTTP API, landing, scoped tokens, cache tier, standbys, reflog
+src/remote.rs     client: batched object transfer, push, fetch, land
+src/project.rs    projected history for read-scoped tokens
+src/git.rs        git import (`git cat-file --batch`) and export (`git fast-import`)
+src/sign.rs       ed25519 change signatures
+src/watch.rs      `sprig watch` file watcher (notify)
+src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
+src/cli.rs        the command line
+tests/            integration tests (CLI as a subprocess, servers in-process)
+bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
 
 ## Measured
@@ -416,14 +413,12 @@ What this shows:
   between commits skip identical directories and win at small sizes.
 - **Storage is about git's at 1k files and ~1.4x at 30k.**
 
-`SPRIG_CPUPROFILE=file` writes a CPU profile of any command.
-
 ## Not done (yet)
 
 - **Code-aware merge covers six languages.** Others (C, C++, C#, Ruby...)
-  get the line merge; adding one is a grammar import plus a table entry in
-  `langs.go`. Only Go output is reformatted; elsewhere merged files keep
-  each side's spacing.
+  get the line merge; adding one is a grammar crate plus a table entry in
+  `src/codemerge.rs`. Merged files keep each side's spacing (Go output is no
+  longer run through gofmt).
 - **One authority holds the refs.** Caches on any machine do the landing
   work and standbys mirror everything, but every ref swap goes to a single
   main server (Scion keeps refs in Spanner). Failover to a standby is manual.

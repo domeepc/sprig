@@ -204,27 +204,40 @@ impl Index {
         (self.find(p.as_bytes()), lo..hi)
     }
 
-    /// Writes recs (sorted by path) as a new index.
-    fn encode(recs: impl Iterator<Item = Rec>, tree: Option<&str>, written: i64) -> Vec<u8> {
-        let (mut body, mut table) = (vec![], vec![]);
+    /// Writes items (sorted by path) as a new index. Records kept as they
+    /// are come from self and are copied without decoding.
+    fn encode(&self, items: impl Iterator<Item = Item>, tree: Option<&str>, written: i64) -> Vec<u8> {
+        let (mut body, mut table) = (Vec::with_capacity(self.n * REC), Vec::with_capacity(self.buf.len()));
         let mut n = 0u32;
-        for r in recs {
-            if r.head.is_none() && r.work.is_none() {
-                continue;
+        for it in items {
+            let start = body.len();
+            match it {
+                Item::Same(i) => {
+                    let path = self.path(i);
+                    body.extend_from_slice(&(table.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&self.rec(i)[4..]);
+                    table.extend_from_slice(path);
+                }
+                Item::New(r) => {
+                    if r.head.is_none() && r.work.is_none() {
+                        continue;
+                    }
+                    body.extend_from_slice(&(table.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&(r.path.len() as u32).to_le_bytes());
+                    table.extend_from_slice(r.path.as_bytes());
+                    body.push(mode_code(r.head.as_ref().map(|h| h.mode)));
+                    body.push(mode_code(r.work.as_ref().map(|w| w.mode)));
+                    body.extend_from_slice(&[0, 0]);
+                    let w = r.work.as_ref();
+                    body.extend_from_slice(&w.map_or(0, |w| w.size).to_le_bytes());
+                    body.extend_from_slice(&w.map_or(0, |w| w.mtime).to_le_bytes());
+                    for id in [r.head.as_ref().map(|h| h.id.as_str()), w.map(|w| w.id.as_str())] {
+                        body.extend_from_slice(&id.and_then(raw_id).unwrap_or([0; 32]));
+                    }
+                }
             }
+            debug_assert_eq!(body.len() - start, REC);
             n += 1;
-            body.extend_from_slice(&(table.len() as u32).to_le_bytes());
-            body.extend_from_slice(&(r.path.len() as u32).to_le_bytes());
-            table.extend_from_slice(r.path.as_bytes());
-            body.push(mode_code(r.head.as_ref().map(|h| h.mode)));
-            body.push(mode_code(r.work.as_ref().map(|w| w.mode)));
-            body.extend_from_slice(&[0, 0]);
-            let w = r.work.as_ref();
-            body.extend_from_slice(&w.map_or(0, |w| w.size).to_le_bytes());
-            body.extend_from_slice(&w.map_or(0, |w| w.mtime).to_le_bytes());
-            for id in [r.head.as_ref().map(|h| h.id.as_str()), w.map(|w| w.id.as_str())] {
-                body.extend_from_slice(&id.and_then(raw_id).unwrap_or([0; 32]));
-            }
         }
         let mut out = Vec::with_capacity(HEADER + body.len() + table.len());
         out.extend_from_slice(MAGIC);
@@ -255,7 +268,7 @@ impl Index {
         &'a self,
         head: &'a BTreeMap<String, Option<FileEnt>>,
         work: &'a BTreeMap<String, Option<Work>>,
-    ) -> impl Iterator<Item = Rec> + 'a {
+    ) -> impl Iterator<Item = Item> + 'a {
         let mut keys: Vec<&String> = head.keys().chain(work.keys()).collect();
         keys.sort();
         keys.dedup();
@@ -265,7 +278,10 @@ impl Index {
             let mut r = if take_rec {
                 let same = k < keys.len() && self.path(i) == keys[k].as_bytes();
                 i += 1;
-                k += same as usize;
+                if !same {
+                    return Some(Item::Same(i - 1));
+                }
+                k += 1;
                 self.rec_owned(i - 1)
             } else if k < keys.len() {
                 k += 1;
@@ -279,9 +295,15 @@ impl Index {
             if let Some(w) = work.get(&r.path) {
                 r.work = w.clone();
             }
-            Some(r)
+            Some(Item::New(r))
         })
     }
+}
+
+/// A record of a new index: one of the old one's as it is, or a new one.
+enum Item {
+    Same(usize),
+    New(Rec),
 }
 
 fn index_path(repo: &Repo) -> PathBuf {
@@ -322,7 +344,7 @@ impl WorkStatus {
     ) {
         let mut all = self.work.clone();
         all.extend(work.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let b = Index::encode(self.idx.patched(head, &all), Some(tree), self.written);
+        let b = self.idx.encode(self.idx.patched(head, &all), Some(tree), self.written);
         let _ = crate::store::write_file_atomic(&index_path(repo), &b, false);
     }
 }
@@ -531,7 +553,7 @@ impl Repo {
         for i in 0..idx.n {
             head.entry(idx.path_str(i)).or_insert(None); // in no tree now
         }
-        let b = Index::encode(idx.patched(&head, &BTreeMap::new()), Some(tree), idx.written);
+        let b = idx.encode(idx.patched(&head, &BTreeMap::new()), Some(tree), idx.written);
         Ok((Index::parse(Buf::Owned(b)), true))
     }
 
@@ -663,9 +685,10 @@ impl Repo {
             deltas.push(Delta::of(&path, idx.head(i), new));
         }
         deltas.sort_by(|a, b| a.path.cmp(&b.path));
-        // A running watcher that could not vouch this time can next time,
-        // from a fresh save.
-        dirty |= !work.is_empty() || (running && !watched);
+        // Save when a file was read again, even unchanged, so that it is
+        // trusted from now on instead of read on every run; and when a
+        // running watcher could not vouch this time, so that it can next time.
+        dirty |= !seen.fresh.is_empty() || !work.is_empty() || (running && !watched);
         Ok(WorkStatus { tree, deltas, idx, written: start, work, dirty })
     }
 
