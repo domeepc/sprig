@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +13,6 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,11 @@ func (r *Repo) PutTree(t *Tree) (string, error) {
 	return r.PutObject(TypeTree, data)
 }
 
+// GetTree returns a parsed tree. It may be shared: callers must not modify it.
 func (r *Repo) GetTree(id string) (*Tree, error) {
+	if t, ok := cachedTree(id); ok {
+		return t, nil
+	}
 	typ, data, err := r.GetObject(id)
 	if err != nil {
 		return nil, err
@@ -86,7 +91,11 @@ func (r *Repo) GetTree(id string) (*Tree, error) {
 	if typ != TypeTree {
 		return nil, fmt.Errorf("object %s is a %s, not a tree", short(id), typ)
 	}
-	return parseTree(data)
+	t, err := parseTree(data)
+	if err == nil {
+		cacheTree(id, t)
+	}
+	return t, err
 }
 
 func (r *Repo) Flatten(treeID string) (Flat, error) {
@@ -309,6 +318,103 @@ type Delta struct {
 	Old  FileEnt
 	New  FileEnt
 	From string // old path of a rename
+}
+
+// DiffTrees compares two trees ("" = empty) like DiffFlat on their
+// flattened forms, but skips every directory that is identical on both
+// sides, so it only reads what changed.
+func (r *Repo) DiffTrees(a, b string) ([]Delta, error) {
+	var out []Delta
+	if err := r.diffTrees(a, b, "", &out); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+func (r *Repo) diffTrees(a, b, prefix string, out *[]Delta) error {
+	if a == b {
+		return nil
+	}
+	entries := func(id string) (map[string]Entry, error) {
+		m := map[string]Entry{}
+		if id == "" {
+			return m, nil
+		}
+		t, err := r.GetTree(id)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range t.Entries {
+			m[e.Name] = e
+		}
+		return m, nil
+	}
+	ea, err := entries(a)
+	if err != nil {
+		return err
+	}
+	eb, err := entries(b)
+	if err != nil {
+		return err
+	}
+	side := func(id, p string, kind string) error { // a whole file or directory added or removed
+		f, err := r.Flatten(id)
+		if err != nil {
+			return err
+		}
+		for q, fe := range f {
+			d := Delta{Path: p + "/" + q, Kind: kind}
+			if kind == "A" {
+				d.New = fe
+			} else {
+				d.Old = fe
+			}
+			*out = append(*out, d)
+		}
+		return nil
+	}
+	for name, x := range ea {
+		p := prefix + name
+		y, inB := eb[name]
+		switch {
+		case inB && x == y:
+		case inB && x.Mode == "dir" && y.Mode == "dir":
+			if err := r.diffTrees(x.ID, y.ID, p+"/", out); err != nil {
+				return err
+			}
+		case x.Mode == "dir":
+			if err := side(x.ID, p, "D"); err != nil {
+				return err
+			}
+			if inB {
+				*out = append(*out, Delta{Path: p, Kind: "A", New: FileEnt{y.Mode, y.ID}})
+			}
+		case inB && y.Mode == "dir":
+			*out = append(*out, Delta{Path: p, Kind: "D", Old: FileEnt{x.Mode, x.ID}})
+			if err := side(y.ID, p, "A"); err != nil {
+				return err
+			}
+		case inB:
+			*out = append(*out, Delta{Path: p, Kind: "M", Old: FileEnt{x.Mode, x.ID}, New: FileEnt{y.Mode, y.ID}})
+		default:
+			*out = append(*out, Delta{Path: p, Kind: "D", Old: FileEnt{x.Mode, x.ID}})
+		}
+	}
+	for name, y := range eb {
+		if _, inA := ea[name]; inA {
+			continue
+		}
+		p := prefix + name
+		if y.Mode == "dir" {
+			if err := side(y.ID, p, "A"); err != nil {
+				return err
+			}
+		} else {
+			*out = append(*out, Delta{Path: p, Kind: "A", New: FileEnt{y.Mode, y.ID}})
+		}
+	}
+	return nil
 }
 
 func DiffFlat(a, b Flat) []Delta {
@@ -551,9 +657,10 @@ type snapper struct {
 	cfg   Config
 	cache statCache
 
-	mu    sync.Mutex
-	flat  Flat
-	fresh statCache
+	mu     sync.Mutex
+	flat   Flat
+	fresh  statCache
+	reread []string // files whose stat didn't match the cache
 }
 
 func (s *snapper) skipDir(name, rel string) bool {
@@ -578,7 +685,7 @@ func (s *snapper) walk(dir, rel string) error {
 	}
 	var visit func(dir, rel string)
 	visit = func(dir, rel string) {
-		ents, err := os.ReadDir(dir)
+		ents, err := listDir(dir)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				fail(err)
@@ -586,13 +693,13 @@ func (s *snapper) walk(dir, rel string) error {
 			return
 		}
 		for _, d := range ents {
-			crel := d.Name()
+			crel := d.name
 			if rel != "" {
-				crel = rel + "/" + d.Name()
+				crel = rel + "/" + d.name
 			}
-			cdir := filepath.Join(dir, d.Name())
-			if d.IsDir() {
-				if s.skipDir(d.Name(), crel) {
+			cdir := dir + string(filepath.Separator) + d.name
+			if d.isDir {
+				if s.skipDir(d.name, crel) {
 					continue
 				}
 				select {
@@ -611,14 +718,7 @@ func (s *snapper) walk(dir, rel string) error {
 			if s.skipFile(crel) {
 				continue
 			}
-			info, err := d.Info()
-			if err != nil {
-				if !errors.Is(err, fs.ErrNotExist) { // deleted while walking: just absent
-					fail(err)
-				}
-				continue
-			}
-			if err := s.file(cdir, crel, info); err != nil {
+			if err := s.file(cdir, crel, d.st); err != nil {
 				fail(err)
 			}
 		}
@@ -630,20 +730,37 @@ func (s *snapper) walk(dir, rel string) error {
 
 // file records one working file, reusing the stat cache's hash when the
 // file's size, mtime and mode are unchanged.
-func (s *snapper) file(abs, rel string, info fs.FileInfo) error {
+// dirent is a directory entry with, for non-directories, its lstat data.
+type dirent struct {
+	name  string
+	isDir bool
+	st    fstat
+}
+
+type fstat struct {
+	mode  fs.FileMode
+	size  int64
+	mtime int64 // unix ns
+}
+
+func statOf(info fs.FileInfo) fstat {
+	return fstat{info.Mode(), info.Size(), info.ModTime().UnixNano()}
+}
+
+func (s *snapper) file(abs, rel string, info fstat) error {
 	mode := "file"
 	switch {
-	case info.Mode()&fs.ModeSymlink != 0:
+	case info.mode&fs.ModeSymlink != 0:
 		mode = "link"
-	case !info.Mode().IsRegular():
+	case !info.mode.IsRegular():
 		return nil // sockets, devices, ...
-	case info.Mode()&0o111 != 0:
+	case info.mode&0o111 != 0:
 		mode = "exec"
 	}
 	// Entries written less than a second before the cache was saved are not
 	// trusted, since an edit within the same timestamp tick would be
 	// invisible ("racily clean", as git calls it).
-	st := statEntry{info.Size(), info.ModTime().UnixNano(), mode, ""}
+	st := statEntry{info.size, info.mtime, mode, ""}
 	if e, ok := s.cache.Files[rel]; ok && e.Size == st.Size && e.MTime == st.MTime && e.Mode == mode &&
 		e.MTime < s.cache.Written-int64(time.Second) && (!s.store || s.r.HasObject(e.ID)) {
 		s.put(rel, e, false)
@@ -704,7 +821,7 @@ func (s *snapper) fromWatcher(dirty []string) error {
 				}
 			}
 		case !s.skipFile(d):
-			if err := s.file(abs, d, info); err != nil {
+			if err := s.file(abs, d, statOf(info)); err != nil {
 				return err
 			}
 		}
@@ -716,7 +833,10 @@ func (s *snapper) put(rel string, e statEntry, changed bool) {
 	s.mu.Lock()
 	s.flat[rel] = FileEnt{e.Mode, e.ID}
 	s.fresh.Files[rel] = e
-	s.fresh.dirty = s.fresh.dirty || changed
+	if changed {
+		s.fresh.dirty = true
+		s.reread = append(s.reread, rel)
+	}
 	s.mu.Unlock()
 }
 
@@ -738,38 +858,65 @@ type statCache struct {
 
 func (r *Repo) statCachePath() string { return filepath.Join(r.Dir, "statcache") }
 
+// The stat cache file: "SPRIGSC1", the save time, then per file the path
+// length and path, size, mtime (all uvarints), a mode byte and the raw id.
+const statCacheMagic = "SPRIGSC1"
+
+var statModes = []string{"file", "exec", "link"}
+
 func (r *Repo) loadStatCache() statCache {
 	c := statCache{Files: map[string]statEntry{}}
 	b, err := os.ReadFile(r.statCachePath())
-	if err != nil {
-		return c
+	if err != nil || !bytes.HasPrefix(b, []byte(statCacheMagic)) {
+		return c // missing, or the old text format: start afresh
 	}
-	lines := strings.Split(string(b), "\n")
-	c.Files = make(map[string]statEntry, len(lines))
-	c.Written, _ = strconv.ParseInt(lines[0], 10, 64)
-	for _, l := range lines[1:] {
-		f := strings.Split(l, "\t")
-		if len(f) != 5 {
-			continue
+	b = b[len(statCacheMagic):]
+	uv := func() uint64 {
+		v, k := binary.Uvarint(b)
+		if k <= 0 {
+			b = nil
+			return 0
 		}
-		size, err1 := strconv.ParseInt(f[1], 10, 64)
-		mtime, err2 := strconv.ParseInt(f[2], 10, 64)
-		if err1 == nil && err2 == nil {
-			c.Files[f[0]] = statEntry{size, mtime, f[3], f[4]}
+		b = b[k:]
+		return v
+	}
+	c.Written = int64(uv())
+	n := uv()
+	c.Files = make(map[string]statEntry, n)
+	for len(b) > 0 {
+		l := uv()
+		if uint64(len(b)) < l {
+			return statCache{Files: map[string]statEntry{}}
 		}
+		p := string(b[:l])
+		b = b[l:]
+		size, mtime := int64(uv()), int64(uv())
+		if len(b) < 33 || int(b[0]) >= len(statModes) {
+			return statCache{Files: map[string]statEntry{}} // torn or corrupt: just re-read files
+		}
+		c.Files[p] = statEntry{size, mtime, statModes[b[0]], hex.EncodeToString(b[1:33])}
+		b = b[33:]
 	}
 	return c
 }
 
 func (r *Repo) saveStatCache(c statCache) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d\n", c.Written)
+	b := append([]byte(statCacheMagic), binary.AppendUvarint(nil, uint64(c.Written))...)
+	b = binary.AppendUvarint(b, uint64(len(c.Files)))
 	for p, e := range c.Files {
-		if !strings.ContainsAny(p, "\t\n") {
-			fmt.Fprintf(&b, "%s\t%d\t%d\t%s\t%s\n", p, e.Size, e.MTime, e.Mode, e.ID)
+		m := slicesIndex(statModes, e.Mode)
+		raw, err := hex.DecodeString(e.ID)
+		if m < 0 || err != nil || len(raw) != 32 {
+			continue
 		}
+		b = binary.AppendUvarint(b, uint64(len(p)))
+		b = append(b, p...)
+		b = binary.AppendUvarint(b, uint64(e.Size))
+		b = binary.AppendUvarint(b, uint64(e.MTime))
+		b = append(b, byte(m))
+		b = append(b, raw...)
 	}
-	atomicWrite(r.statCachePath(), []byte(b.String())) // best effort: losing it only costs a re-read
+	atomicWrite(r.statCachePath(), b) // best effort: losing it only costs a re-read
 }
 
 // dirInView reports whether a directory holds anything in the sparse view.
@@ -810,12 +957,14 @@ func (r *Repo) Materialize(from, to Flat) error {
 		}
 	}
 	sort.Strings(paths)
+	dirs := map[string]bool{}
 	for _, p := range paths {
 		te := to[p]
-		if fe, ok := from[p]; ok && fe == te {
+		fe, had := from[p]
+		if had && fe == te {
 			continue
 		}
-		if err := r.writeFile(p, te); err != nil {
+		if err := r.writeFileIn(p, te, dirs, had && fe.Mode == te.Mode && te.Mode != "link"); err != nil {
 			return err
 		}
 	}
@@ -831,25 +980,35 @@ func (r *Repo) pruneDirs(dir string) {
 	}
 }
 
-func (r *Repo) writeFile(rel string, fe FileEnt) error {
+func (r *Repo) writeFile(rel string, fe FileEnt) error { return r.writeFileIn(rel, fe, nil, false) }
+
+// writeFileIn writes one working file. dirs remembers directories already
+// checked during this checkout; sameMode says the file is already there with
+// the right permissions.
+func (r *Repo) writeFileIn(rel string, fe FileEnt, dirs map[string]bool, sameMode bool) error {
 	a := r.abs(rel)
 	if !strings.HasPrefix(a, r.Root+string(filepath.Separator)) {
 		return fmt.Errorf("refusing to write outside the repository: %s", rel)
 	}
 	// Clear anything in the way: a file where a directory must go, or a
 	// directory where a file must go.
-	parts := strings.Split(rel, "/")
-	cur := r.Root
-	for _, seg := range parts[:len(parts)-1] {
-		cur = filepath.Join(cur, seg)
-		if st, err := os.Lstat(cur); err == nil && !st.IsDir() {
-			if err := os.Remove(cur); err != nil {
-				return err
+	if dir := path.Dir(rel); !dirs[dir] {
+		parts := strings.Split(rel, "/")
+		cur := r.Root
+		for _, seg := range parts[:len(parts)-1] {
+			cur = filepath.Join(cur, seg)
+			if st, err := os.Lstat(cur); err == nil && !st.IsDir() {
+				if err := os.Remove(cur); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	if err := os.MkdirAll(filepath.Dir(a), 0o755); err != nil {
-		return err
+		if err := os.MkdirAll(filepath.Dir(a), 0o755); err != nil {
+			return err
+		}
+		if dirs != nil {
+			dirs[dir] = true
+		}
 	}
 	if st, err := os.Lstat(a); err == nil && st.IsDir() {
 		if err := os.RemoveAll(a); err != nil {
@@ -871,7 +1030,10 @@ func (r *Repo) writeFile(rel string, fe FileEnt) error {
 	if err := os.WriteFile(a, data, perm); err != nil {
 		return err
 	}
-	return os.Chmod(a, perm)
+	if sameMode {
+		return nil
+	}
+	return os.Chmod(a, perm) // WriteFile only sets permissions on new files
 }
 
 // IsDirty reports whether the working tree differs from the given flat tree.
