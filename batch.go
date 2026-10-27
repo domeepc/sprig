@@ -138,6 +138,7 @@ func (s *Server) handlePutObjects(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]int{"stored": n})
+	s.repo.maybeAutoGC()
 }
 
 // checkObject returns why an object may not be stored, or "".

@@ -505,6 +505,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 			continue // someone landed meanwhile: re-merge onto the new tip
 		}
 		writeJSON(w, 200, LandResult{id, tip, retries})
+		s.repo.maybeAutoGC()
 		return
 	}
 	httpErr(w, 503, "%s moved %d times during landing; try again", u.Branch, maxLandRetries)
