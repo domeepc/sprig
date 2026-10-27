@@ -5,10 +5,12 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 7,300 lines of Go plus 1,500 of tests. Dependencies outside
-the standard library: `fsnotify` (for `sprig watch`) and `klauspost/compress`
-(zstd, for packs). It needs `git` on the PATH only for
-`import-git`/`export-git`.
+Prototype, about 8,600 lines of Go plus 1,800 of tests. Dependencies outside
+the standard library: `fsnotify` (for `sprig watch`), `klauspost/compress`
+(zstd, for packs) and tree-sitter with its Python, JavaScript, TypeScript,
+Rust and Java grammars (for code-aware merge). Tree-sitter is C, so building
+needs cgo and a C compiler (gcc or clang); `CGO_ENABLED=0` builds fail. It
+needs `git` on the PATH only for `import-git`/`export-git`.
 
 ```
 go build -o sprig .
@@ -28,7 +30,7 @@ go test ./...
 | **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths, and `--hunk path:N` only some hunks of a file. |
 | **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read, including ones rebuilt from deltas in a pack. |
 | **Merges follow renames** | Renames are detected by content (`-M` sets the similarity, default 50%). When one side renames a file and the other edits it, the edit lands in the renamed file; files added to a directory the other side moved follow it. `land` does the same against renames that landed after your base. |
-| **Merges understand Go** | When a line merge of a `.go` file conflicts, sprig retries per import and per top-level declaration, so two sides adding imports or functions merge cleanly. |
+| **Merges understand code** | When a line merge conflicts, sprig retries per import and per top-level declaration for Go (`go/parser`), Python, JavaScript/JSX, TypeScript/TSX, Rust and Java (tree-sitter), and per member inside a class, `impl` or Java type both sides changed. Two sides adding imports or functions merge cleanly; the same function changed both ways still conflicts. The result must parse without errors. |
 
 ## Quick tour
 
@@ -305,7 +307,8 @@ gitexport.go  sprig -> git converter (via `git fast-import`)
 batch.go      batched object transfer
 sign.go       ed25519 change signatures
 pack.go       packfiles (zstd, compact trees, deltas), gc, auto gc
-astmerge.go   Go-aware merge (go/parser)
+astmerge.go   Go-aware merge (go/parser), shared unit merge
+langs.go      tree-sitter merge for Python, JS/TS, Rust, Java
 watch.go      `sprig watch` file watcher (fsnotify)
 follow.go     ref long-poll, caches following upstream, read-only standbys
 reflog.go     server ref log
@@ -328,8 +331,10 @@ Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
 
 ## Not done (yet)
 
-- **Code-aware merge is Go only.** It uses the standard library's parser;
-  other languages would need tree-sitter, a cgo dependency.
+- **Code-aware merge covers six languages.** Others (C, C++, C#, Ruby...)
+  get the line merge; adding one is a grammar import plus a table entry in
+  `langs.go`. Only Go output is reformatted; elsewhere merged files keep
+  each side's spacing.
 - **One authority holds the refs.** Caches on any machine do the landing
   work and standbys mirror everything, but every ref swap goes to a single
   main server (Scion keeps refs in Spanner). Failover to a standby is manual.
