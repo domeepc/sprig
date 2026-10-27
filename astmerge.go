@@ -131,6 +131,12 @@ func declKey(d ast.Decl, src []byte, off func(token.Pos) int) string {
 
 // pick3 merges one unit: present flags and texts for base, ours, theirs.
 func pick3(b, o, t string, hb, ho, ht bool) (string, bool, bool) {
+	return pick3With(b, o, t, hb, ho, ht, nil)
+}
+
+// pick3With is pick3 with a merge for "both sides changed it" (nil: a line
+// merge of the unit's text).
+func pick3With(b, o, t string, hb, ho, ht bool, both func(b, o, t string) (string, bool)) (string, bool, bool) {
 	switch {
 	case ho && ht && o == t:
 		return o, true, true
@@ -138,7 +144,10 @@ func pick3(b, o, t string, hb, ho, ht bool) (string, bool, bool) {
 		return t, true, true
 	case ho && ht && hb && t == b:
 		return o, true, true
-	case ho && ht: // both changed (or both added) the same declaration
+	case ho && ht && both != nil: // both changed (or both added) the same declaration
+		text, ok := both(b, o, t)
+		return text, true, ok
+	case ho && ht:
 		res := Merge3(splitLines([]byte(b)), splitLines([]byte(o)), splitLines([]byte(t)), "ours", "theirs")
 		return strings.Join(res.Lines, ""), true, res.Conflicts == 0
 	case ho && !hb:
@@ -176,31 +185,9 @@ func goMerge(base, ours, theirs []byte) ([]byte, bool) {
 			imports[k] = v
 		}
 	}
-	// declarations in ours' order, with theirs' additions after the
-	// declaration they follow in theirs
-	order := append([]string{}, of.order...)
-	for i, k := range tf.order {
-		if _, inO := of.decls[k]; inO {
-			continue
-		}
-		if _, inB := bf.decls[k]; inB {
-			continue // ours deleted it
-		}
-		at := len(order)
-		for j := i - 1; j >= 0; j-- {
-			if p := indexOf(order, tf.order[j]); p >= 0 {
-				at = p + 1
-				break
-			}
-		}
-		order = append(order[:at], append([]string{k}, order[at:]...)...)
-	}
-	for k := range bf.decls { // deleted by ours but changed by theirs is a conflict
-		if _, inO := of.decls[k]; !inO && indexOf(order, k) < 0 {
-			if t, inT := tf.decls[k]; inT && t != bf.decls[k] {
-				return nil, false
-			}
-		}
+	order, ok := mergeOrder(bf.decls, of.order, of.decls, tf.order, tf.decls)
+	if !ok {
+		return nil, false
 	}
 	var out bytes.Buffer
 	out.WriteString(strings.TrimRight(header, "\n") + "\n")
@@ -229,6 +216,45 @@ func goMerge(base, ours, theirs []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return res, true
+}
+
+// mergeOrder gives the merged sequence of unit keys: ours' order, with
+// theirs' additions placed after the unit they follow in theirs. It reports
+// false when ours deleted a unit that theirs changed.
+func mergeOrder(b map[string]string, oOrder []string, o map[string]string, tOrder []string, t map[string]string) ([]string, bool) {
+	order := append([]string{}, oOrder...)
+	for i, k := range tOrder {
+		if _, inO := o[k]; inO {
+			continue
+		}
+		if _, inB := b[k]; inB {
+			continue // ours deleted it
+		}
+		at := len(order)
+		for j := i - 1; j >= 0; j-- {
+			if p := indexOf(order, tOrder[j]); p >= 0 {
+				at = p + 1
+				break
+			}
+		}
+		for at < len(order) { // after what ours added at the same spot, as git does
+			_, inB := b[order[at]]
+			_, inT := t[order[at]]
+			if inB || inT {
+				break
+			}
+			at++
+		}
+		order = append(order[:at], append([]string{k}, order[at:]...)...)
+	}
+	for k, bt := range b {
+		if _, inO := o[k]; !inO && indexOf(order, k) < 0 {
+			if tt, inT := t[k]; inT && tt != bt {
+				return nil, false
+			}
+		}
+	}
+	return order, true
 }
 
 func indexOf(list []string, s string) int {
