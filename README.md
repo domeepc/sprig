@@ -5,9 +5,9 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 6,600 lines of Go plus 1,400 of tests, no dependencies
-outside the standard library. It needs `git` on the PATH only for
-`import-git`/`export-git`.
+Prototype, about 7,000 lines of Go plus 1,400 of tests. The only dependency
+outside the standard library is `fsnotify` (for `sprig watch`). It needs
+`git` on the PATH only for `import-git`/`export-git`.
 
 ```
 go build -o sprig .
@@ -51,6 +51,7 @@ sprig commit -m "docs only" README.md docs/   # commit just these paths
 sprig diff                                     # hunks are numbered: "@@ ... @@ hunk 2"
 sprig commit -m "one fix" --hunk main.go:2     # commit just that hunk
 sprig gc                                       # pack objects, deltas between versions
+sprig watch &                                  # optional: status re-checks only changed files
 ```
 
 ### Importing from git
@@ -237,6 +238,16 @@ API (all paths under `/v1`, bearer token when configured):
 A record is `<id> <type> <len>\n` followed by `<len>` bytes; every object is
 hash-checked on arrival.
 
+### Faster status with `sprig watch`
+
+`status` and `commit` normally `lstat` every file (in parallel) and only read
+the ones whose size or mtime changed. `sprig watch` runs in the background,
+watches the working tree with inotify/kqueue, and tells them which paths
+changed since the last check, so nothing else is touched. Without a running
+watcher, or when it can't vouch for the whole period (just started, event
+overflow, `.sprigignore` changed), sprig falls back to the full walk. Set
+`SPRIG_NO_WATCH=1` to ignore a running watcher.
+
 ## Environment
 
 | Variable | Used for |
@@ -245,6 +256,7 @@ hash-checked on arrival.
 | `SPRIG_AGENT`, `SPRIG_MODEL` | default `--agent` / `--model` for commit and land |
 | `SPRIG_TOKEN` | bearer token for `serve` and for clients; a cache uses it to reach upstream |
 | `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
+| `SPRIG_NO_WATCH` | ignore a running `sprig watch` and walk the whole tree |
 
 ## Layout
 
@@ -260,6 +272,7 @@ batch.go      batched object transfer
 sign.go       ed25519 change signatures
 pack.go       packfiles, deltas, gc
 astmerge.go   Go-aware merge (go/parser)
+watch.go      `sprig watch` file watcher (fsnotify)
 main.go       CLI
 ```
 
@@ -267,7 +280,9 @@ main.go       CLI
 
 A synthetic git repo with 3,001 commits and 300 files imports in about 8s;
 afterwards `status` takes 8 ms and `log` 4 ms. With 3,000 files, `status`
-takes about 17 ms (49 ms before the stat cache); git takes about 1 ms.
+takes about 7.4 ms (49 ms before the stat cache, 17 ms before the parallel
+walk), or 5.3 ms with `sprig watch` running; git takes about 1.5 ms. Starting
+the sprig process alone takes about 2.3 ms of that.
 
 Storage, 300 Go files with 300 commits of small edits: git after `git gc`
 856 KB; sprig 2.8 MB of loose objects (10.7 MB on disk, one file each),
@@ -284,9 +299,10 @@ Reading from packs stays fast: `status` 6 ms, `log -n 300` 17 ms.
 - **Read-scoped tokens can't clone.** Objects are fetched by id alone, so
   these tokens are limited to `/file`, `/ls` and `land`. History metadata
   (`/log`, `/changes`) is visible to every token.
-- **`status` is ~17 ms at 3,000 files, git ~1 ms.** The stat cache skips
-  reading files, but every file is still `lstat`-ed and the cache is a text
-  file rather than a memory-mapped index.
+- **`status` is ~5–7 ms at 3,000 files, git ~1.5 ms.** What's left is process
+  startup (~2.3 ms) and building in-memory maps of every file; a
+  memory-mapped index that status could compare without maps would close
+  more of it.
 - **Storage is ~1.2x git's after `gc`**, and loose objects (one file each)
   accumulate until you run it. There is no automatic gc or repacking of old
   packs into one.
