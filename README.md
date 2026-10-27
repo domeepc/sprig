@@ -5,17 +5,59 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 8,600 lines of Go plus 1,800 of tests. Dependencies outside
+Prototype, about 9,600 lines of Go plus 2,000 of tests. Dependencies outside
 the standard library: `fsnotify` (for `sprig watch`), `klauspost/compress`
 (zstd, for packs) and tree-sitter with its Python, JavaScript, TypeScript,
-Rust and Java grammars (for code-aware merge). Tree-sitter is C, so building
-needs cgo and a C compiler (gcc or clang); `CGO_ENABLED=0` builds fail. It
-needs `git` on the PATH only for `import-git`/`export-git`.
+Rust and Java grammars (for code-aware merge). All are pinned by hash in
+`go.sum`.
 
-```
+## Install
+
+You need:
+
+- **Go 1.26 or newer.** Check with `go version`. Older Go (1.21+) offers to
+  download 1.26 by itself; set `GOTOOLCHAIN=local` to refuse that and
+  install it yourself instead.
+- **A C compiler** (gcc or clang). Tree-sitter is C, so sprig builds with
+  cgo; `CGO_ENABLED=0` builds fail.
+- **git**, only for `import-git`/`export-git` and for fetching the source.
+
+| System | Command |
+|---|---|
+| Fedora / RHEL | `sudo dnf install golang gcc git` |
+| Debian / Ubuntu | `sudo apt install golang gcc git` (if its Go is older than 1.26, get Go from go.dev/dl) |
+| Arch | `sudo pacman -S go gcc git` |
+| macOS | `xcode-select --install` (clang and git), then `brew install go` |
+| Windows | Go from go.dev/dl, plus gcc from MSYS2 (`pacman -S mingw-w64-ucrt-x86_64-gcc`) on the PATH. Untested; `sprig watch` is Unix only. |
+
+Build and put it on your PATH:
+
+```sh
+git clone https://github.com/domeepc/sprig.git
+cd sprig
 go build -o sprig .
-go test ./...
+install -m 755 sprig ~/.local/bin/    # or: sudo install -m 755 sprig /usr/local/bin/
+sprig version
 ```
+
+(`go install github.com/...` does not work: the module is named `sprig`, not
+its GitHub path.) `~/.local/bin` must be on your PATH; if `sprig version`
+isn't found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or
+`~/.zshrc`.
+
+Check the build with `go test ./...`; one known failure,
+`TestServerRejectsBadObjects` (`a//b` path), is expected for now.
+
+Optional setup:
+
+- `sprig keygen`: sign your changes (key in `~/.config/sprig/`).
+- `SPRIG_AUTHOR="Name <email>"`: author for your changes (see
+  [Environment](#environment)).
+- `sprig watch` in a repo you work in a lot keeps `status` fast.
+- Running a server: see `sprig serve` under [Quick tour](#quick-tour).
+
+To update: `git pull && go build -o sprig . && install -m 755 sprig ~/.local/bin/`.
+To uninstall: delete the binary, and `~/.config/sprig` if you made a key.
 
 ## What's different from git
 
