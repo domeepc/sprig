@@ -2,17 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -21,17 +22,38 @@ import (
 // about the repo (history, files, refs) is an API call; no local clone.
 
 type Server struct {
-	repo  *Repo
-	token string
-	mu    sync.Mutex // serializes ref updates
+	repo     *Repo
+	token    string              // full access
+	scopes   map[string][]string // token -> path prefixes it may land in
+	upstream *Remote             // set when this server is a cache in front of another
 }
 
 const maxObjectSize = 256 << 20
 
 func NewServer(r *Repo, token string) *Server { return &Server{repo: r, token: token} }
 
+type scopeKey struct{}
+
+func inScope(scope []string, p string) bool {
+	for _, pre := range scope {
+		if p == pre || strings.HasPrefix(p, pre+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if s.upstream != nil {
+		// Cache tier: objects never change, so they are served locally once
+		// fetched; everything else (refs, landing, log, ...) goes upstream.
+		u, _ := url.Parse(s.upstream.URL)
+		mux.Handle("/v1/", &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(u) }})
+		mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
+		mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
+		return s.auth(mux)
+	}
 	mux.HandleFunc("GET /v1/refs", s.handleRefs)
 	mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 	mux.HandleFunc("PUT /v1/object/{id}", s.handlePutObject)
@@ -47,14 +69,22 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if s.token != "" {
-			got := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
-				httpErr(w, http.StatusUnauthorized, "unauthorized")
+		if s.token == "" && len(s.scopes) == 0 {
+			next.ServeHTTP(w, req)
+			return
+		}
+		got := []byte(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
+		if s.token != "" && subtle.ConstantTimeCompare(got, []byte(s.token)) == 1 {
+			next.ServeHTTP(w, req)
+			return
+		}
+		for tok, scope := range s.scopes {
+			if subtle.ConstantTimeCompare(got, []byte(tok)) == 1 {
+				next.ServeHTTP(w, req.WithContext(context.WithValue(req.Context(), scopeKey{}, scope)))
 				return
 			}
 		}
-		next.ServeHTTP(w, req)
+		httpErr(w, http.StatusUnauthorized, "unauthorized")
 	})
 }
 
@@ -72,12 +102,23 @@ func (s *Server) handleRefs(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, 200, map[string]any{"refs": s.repo.ListRefs()})
 }
 
+// fill copies an object from upstream into a cache server's store.
+func (s *Server) fill(id string) {
+	if s.upstream == nil || s.repo.HasObject(id) {
+		return
+	}
+	if typ, data, err := s.upstream.GetObject(id); err == nil { // hash-verified
+		s.repo.PutObject(typ, data)
+	}
+}
+
 func (s *Server) handleGetObject(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
 	if !idRe.MatchString(id) {
 		httpErr(w, 400, "bad id")
 		return
 	}
+	s.fill(id)
 	typ, data, err := s.repo.GetObject(id)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
@@ -163,8 +204,16 @@ func (s *Server) handleUpdateRef(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "bad json")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if _, scoped := req.Context().Value(scopeKey{}).([]string); scoped {
+		httpErr(w, 403, "this token may only land changes, not move refs")
+		return
+	}
+	unlock, err := s.repo.lockRefs()
+	if err != nil {
+		httpErr(w, 500, "%v", err)
+		return
+	}
+	defer unlock()
 	cur, _ := s.repo.ReadRef(name)
 	if cur != u.Old {
 		httpErr(w, 409, "ref moved: expected %q, found %q", short(u.Old), short(cur))
@@ -212,7 +261,8 @@ func (s *Server) handleUpdateRef(w http.ResponseWriter, req *http.Request) {
 // edited against, and the server applies them onto the branch's current tip.
 // The merge runs outside the lock; only the ref swap is serialized, and it
 // retries on a fresh tip if another landing got in first, so landings don't
-// queue behind each other and nothing has to be cloned or pushed.
+// queue behind each other and nothing has to be cloned or pushed. The lock is
+// a file lock, so several server processes can share one repository.
 
 type LandFile struct {
 	Mode string `json:"mode"` // file | exec | link
@@ -258,19 +308,31 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "bad base id")
 		return
 	}
-	base, err := s.repo.ChangeFlat(u.Base)
+	baseTree, err := s.treeOf(u.Base)
 	if err != nil {
 		httpErr(w, 400, "unknown base change %s", short(u.Base))
 		return
 	}
-	ours := maps.Clone(base)
+	scope, scoped := req.Context().Value(scopeKey{}).([]string)
+	// Only the edited paths are looked at, so a landing costs the same in a
+	// small repo and a huge one.
+	base, ours := Flat{}, Flat{}
 	for p, f := range u.Files {
 		if !validPath(p) {
 			httpErr(w, 400, "bad path %q", p)
 			return
 		}
+		if scoped && !inScope(scope, p) {
+			httpErr(w, 403, "this token may not write %q", p)
+			return
+		}
+		if be, ok, err := s.repo.lookup(baseTree, p); err != nil {
+			httpErr(w, 500, "%v", err)
+			return
+		} else if ok {
+			base[p] = be
+		}
 		if f == nil {
-			delete(ours, p)
 			continue
 		}
 		if f.Mode != "file" && f.Mode != "exec" && f.Mode != "link" {
@@ -289,10 +351,25 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 	}
 	for retries := 0; retries < maxLandRetries; retries++ {
 		tip, _ := s.repo.ReadRef(name)
-		theirs, err := s.repo.ChangeFlat(tip)
+		tipTree, err := s.treeOf(tip)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
+		}
+		theirs := Flat{}
+		for p := range u.Files {
+			te, ok, err := s.repo.lookup(tipTree, p)
+			if err != nil {
+				httpErr(w, 500, "%v", err)
+				return
+			}
+			if ok && te.Mode == "dir" || base[p].Mode == "dir" {
+				httpErr(w, 422, "path %q is a directory", p)
+				return
+			}
+			if ok {
+				theirs[p] = te
+			}
 		}
 		merged, conflicts, err := s.repo.MergeFlat(base, ours, theirs, "landing", u.Branch)
 		if err != nil {
@@ -309,7 +386,15 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 				"conflicts": paths, "tip": tip})
 			return
 		}
-		tree, err := s.repo.BuildTree(merged)
+		edits := map[string]*FileEnt{}
+		for p := range u.Files {
+			if fe, ok := merged[p]; ok {
+				edits[p] = &fe
+			} else {
+				edits[p] = nil
+			}
+		}
+		tree, err := s.repo.updateTree(tipTree, edits)
 		if err != nil {
 			httpErr(w, 422, "%v", err)
 			return
@@ -325,14 +410,18 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 			httpErr(w, 500, "%v", err)
 			return
 		}
-		s.mu.Lock()
+		unlock, err := s.repo.lockRefs()
+		if err != nil {
+			httpErr(w, 500, "%v", err)
+			return
+		}
 		cur, _ := s.repo.ReadRef(name)
 		if cur != tip {
-			s.mu.Unlock()
+			unlock()
 			continue // someone landed meanwhile: re-merge onto the new tip
 		}
 		err = s.repo.WriteRef(name, id)
-		s.mu.Unlock()
+		unlock()
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -341,6 +430,17 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	httpErr(w, 503, "%s moved %d times during landing; try again", u.Branch, maxLandRetries)
+}
+
+func (s *Server) treeOf(changeID string) (string, error) {
+	if changeID == "" {
+		return "", nil
+	}
+	c, err := s.repo.GetChange(changeID)
+	if err != nil {
+		return "", err
+	}
+	return c.Tree, nil
 }
 
 func (s *Server) resolve(req *http.Request) (string, error) {
@@ -379,6 +479,9 @@ func (s *Server) handleLog(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) handleChange(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
+	if idRe.MatchString(id) {
+		s.fill(id)
+	}
 	c, err := s.repo.GetChange(id)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
@@ -460,8 +563,12 @@ func (r *Repo) Remote(name string) (*Remote, error) {
 	if !ok {
 		return nil, fmt.Errorf("no such remote %q (add one with `sprig remote add`)", name)
 	}
+	return newRemote(name, u), nil
+}
+
+func newRemote(name, u string) *Remote {
 	return &Remote{Name: name, URL: strings.TrimRight(u, "/"), Token: os.Getenv("SPRIG_TOKEN"),
-		hc: &http.Client{Timeout: 5 * time.Minute}}, nil
+		hc: &http.Client{Timeout: 5 * time.Minute}}
 }
 
 func (rm *Remote) do(method, path string, body []byte, hdr map[string]string) ([]byte, http.Header, error) {
@@ -580,6 +687,7 @@ func (rm *Remote) Land(lr *LandRequest) (*LandResult, error) {
 
 // closure returns every object reachable from id, dependencies first.
 func (r *Repo) closure(id string) ([]string, error) {
+	lazy := r.LoadConfig().Lazy != ""
 	var order []string
 	seen := map[string]bool{}
 	var visit func(string) error
@@ -588,6 +696,9 @@ func (r *Repo) closure(id string) ([]string, error) {
 			return nil
 		}
 		seen[id] = true
+		if lazy && !r.HasObject(id) {
+			return nil // never downloaded, so it came from the remote, which has it
+		}
 		typ, data, err := r.GetObject(id)
 		if err != nil {
 			return err
@@ -723,6 +834,7 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 	if !ok {
 		return "", 0, fmt.Errorf("remote has no branch %q", branch)
 	}
+	lazy := r.LoadConfig().Lazy != ""
 	n := 0
 	var fetch func(string) error
 	fetch = func(id string) error {
@@ -736,6 +848,18 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 		kids, err := Children(typ, data)
 		if err != nil {
 			return err
+		}
+		if lazy && typ == TypeTree { // file contents are fetched when first read
+			t, err := parseTree(data)
+			if err != nil {
+				return err
+			}
+			kids = kids[:0]
+			for _, e := range t.Entries {
+				if e.Mode == "dir" {
+					kids = append(kids, e.ID)
+				}
+			}
 		}
 		for _, k := range kids {
 			if err := fetch(k); err != nil {
@@ -754,13 +878,16 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 	return tip, n, r.WriteRef("remotes/"+rm.Name+"/"+branch, tip)
 }
 
-func serve(r *Repo, addr, token string) error {
-	if !isLoopback(addr) && token == "" {
-		return errors.New("refusing to listen on a non-loopback address without --token (or SPRIG_TOKEN)")
+func serve(s *Server, addr string) error {
+	if !isLoopback(addr) && s.token == "" && len(s.scopes) == 0 {
+		return errors.New("refusing to listen on a non-loopback address without --token (or SPRIG_TOKEN) or --tokens")
 	}
-	srv := &http.Server{Addr: addr, Handler: NewServer(r, token).Handler(),
-		ReadHeaderTimeout: 10 * time.Second}
-	fmt.Fprintf(stdout, "serving %s on http://%s\n", r.Dir, addr)
+	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	what := s.repo.Dir
+	if s.upstream != nil {
+		what = "cache of " + s.upstream.URL
+	}
+	fmt.Fprintf(stdout, "serving %s on http://%s\n", what, addr)
 	return srv.ListenAndServe()
 }
 

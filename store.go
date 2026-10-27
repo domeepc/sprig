@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -100,6 +101,21 @@ type Repo struct {
 type Config struct {
 	Author  string            `json:"author,omitempty"`
 	Remotes map[string]string `json:"remotes,omitempty"`
+	Lazy    string            `json:"lazy,omitempty"`   // remote that missing objects are fetched from on demand
+	Sparse  []string          `json:"sparse,omitempty"` // only these path prefixes are in the working tree
+}
+
+// inView reports whether path p is part of a sparse working tree.
+func (c Config) inView(p string) bool {
+	if len(c.Sparse) == 0 {
+		return true
+	}
+	for _, pre := range c.Sparse {
+		if p == pre || strings.HasPrefix(p, pre+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func InitRepo(root string, bare bool, branch string) (*Repo, error) {
@@ -214,14 +230,38 @@ func (r *Repo) PutObject(typ string, data []byte) (string, error) {
 	return id, nil
 }
 
+var errObjectNotFound = errors.New("not found")
+
+// GetObject reads an object; in a lazy clone a missing one is fetched from
+// the configured remote (hash-verified) and kept.
 func (r *Repo) GetObject(id string) (string, []byte, error) {
+	typ, data, err := r.getLocal(id)
+	if !errors.Is(err, errObjectNotFound) || r.Bare {
+		return typ, data, err
+	}
+	c := r.LoadConfig()
+	if c.Lazy == "" {
+		return typ, data, err
+	}
+	rm, rerr := r.Remote(c.Lazy)
+	if rerr != nil {
+		return "", nil, rerr
+	}
+	if typ, data, err = rm.GetObject(id); err != nil {
+		return "", nil, err
+	}
+	_, err = r.PutObject(typ, data)
+	return typ, data, err
+}
+
+func (r *Repo) getLocal(id string) (string, []byte, error) {
 	if !idRe.MatchString(id) {
 		return "", nil, fmt.Errorf("invalid object id %q", id)
 	}
 	f, err := os.Open(r.objPath(id))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", nil, fmt.Errorf("object %s not found", short(id))
+			return "", nil, fmt.Errorf("object %s %w", short(id), errObjectNotFound)
 		}
 		return "", nil, err
 	}
@@ -399,6 +439,21 @@ func (r *Repo) WriteRef(name, id string) error {
 		return fmt.Errorf("invalid id %q", id)
 	}
 	return atomicWrite(r.refPath(name), []byte(id+"\n"))
+}
+
+// lockRefs takes an exclusive lock shared by every process using this
+// repository, so ref compare-and-swaps from several servers cannot interleave.
+// shortcut: flock is Unix-only and local-disk only; needs a lock service for servers on different machines.
+func (r *Repo) lockRefs() (func(), error) {
+	f, err := os.OpenFile(filepath.Join(r.Dir, "refs.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { f.Close() }, nil // closing releases the lock
 }
 
 func (r *Repo) DeleteRef(name string) error {

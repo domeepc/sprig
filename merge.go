@@ -44,29 +44,27 @@ func (r *Repo) IsAncestor(anc, desc string) (bool, error) {
 	return ok, nil
 }
 
-// MergeBase returns a best common ancestor of a and b ("" if unrelated).
-// Criss-cross histories pick one candidate rather than recursing.
-func (r *Repo) MergeBase(a, b string) (string, error) {
+// MergeBases returns every best common ancestor of a and b: common
+// ancestors that are not themselves behind another one. Criss-cross
+// histories have more than one.
+func (r *Repo) MergeBases(a, b string) ([]string, error) {
 	aset, err := r.Ancestors(a)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	seen := map[string]bool{b: true}
 	queue := []string{b}
-	var best string
-	bestDist := -1
+	var frontier []string
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
-		if d, ok := aset[cur]; ok {
-			if bestDist < 0 || d < bestDist {
-				best, bestDist = cur, d
-			}
-			continue // everything behind a common ancestor is also common
+		if _, ok := aset[cur]; ok {
+			frontier = append(frontier, cur)
+			continue
 		}
 		c, err := r.GetChange(cur)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		for _, p := range c.Parents {
 			if !seen[p] {
@@ -75,7 +73,58 @@ func (r *Repo) MergeBase(a, b string) (string, error) {
 			}
 		}
 	}
+	var best []string
+	for _, x := range frontier {
+		behind := false
+		for _, y := range frontier {
+			if x == y {
+				continue
+			}
+			if anc, err := r.IsAncestor(x, y); err != nil {
+				return nil, err
+			} else if anc {
+				behind = true
+				break
+			}
+		}
+		if !behind {
+			best = append(best, x)
+		}
+	}
+	sort.Strings(best)
 	return best, nil
+}
+
+// mergeBaseFlat is the tree to three-way merge a and b against. With several
+// best common ancestors they are merged into a virtual base first, recursively,
+// like git's recursive strategy. Conflicts inside the virtual base stay as
+// markers, which then usually resolve against the two real sides.
+func (r *Repo) mergeBaseFlat(a, b string, depth int) (Flat, error) {
+	bases, err := r.MergeBases(a, b)
+	if err != nil || len(bases) == 0 {
+		return Flat{}, err
+	}
+	virtual, err := r.ChangeFlat(bases[0])
+	if err != nil {
+		return nil, err
+	}
+	for _, other := range bases[1:] {
+		if depth >= 8 { // shortcut: very deep criss-cross nesting falls back to one base
+			break
+		}
+		ob, err := r.ChangeFlat(other)
+		if err != nil {
+			return nil, err
+		}
+		under, err := r.mergeBaseFlat(bases[0], other, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if virtual, _, err = r.MergeFlat(under, virtual, ob, "base", "base"); err != nil {
+			return nil, err
+		}
+	}
+	return virtual, nil
 }
 
 type logItem struct {
@@ -382,11 +431,7 @@ func (r *Repo) Merge(targetRev string, noFF bool, msg string, meta Meta) (*Merge
 		}
 		return &MergeOutcome{Kind: "fast-forward", Change: target}, nil
 	}
-	baseID, err := r.MergeBase(cur, target)
-	if err != nil {
-		return nil, err
-	}
-	baseFlat, err := r.ChangeFlat(baseID)
+	baseFlat, err := r.mergeBaseFlat(cur, target, 0)
 	if err != nil {
 		return nil, err
 	}

@@ -85,7 +85,51 @@ curl -X POST $SERVER/v1/land -H "Authorization: Bearer $SPRIG_TOKEN" -d '{
 
 `data` is base64 and `null` deletes. A conflict returns HTTP 409 with the
 paths and the current tip, and nothing lands. Landed changes are linear: one
-parent, never a merge.
+parent, never a merge. The server only looks up the edited paths and rewrites
+the directories along them, so a landing costs about the same whatever the
+size of the repository.
+
+### Scaling out: several servers and caches
+
+The ref swap uses a file lock, so several `sprig serve` processes can share
+one repository directory (on one machine) and land concurrently.
+
+A cache server keeps its own copy of objects, which never change once written,
+and passes everything else (refs, landing, log) through to the main server:
+
+```sh
+sprig init --bare cache.sprig
+sprig serve --addr 127.0.0.1:7701 --upstream http://main-host:7700 cache.sprig
+```
+
+Point clients at the cache. It checks tokens the same way the main server
+does (`--token`, `--tokens`) and fetches from upstream with `SPRIG_TOKEN`.
+
+### Partial clones
+
+```sh
+sprig clone --path services/api http://127.0.0.1:7700 work
+```
+
+This downloads history and directory trees but no file contents. Only files
+under `--path` are written to disk; leave `--path` out to check out
+everything. Any file content sprig needs later (diff, merge, show) is
+downloaded on first use and kept. Files outside the view count as unchanged,
+so `commit`, `land` and `push` work as usual.
+
+### Per-directory permissions
+
+```sh
+cat > tokens.json <<'JSON'
+{ "docs-bot-token-0123456789": ["docs"],
+  "api-team-token-0123456789": ["services/api", "libs/common"] }
+JSON
+SPRIG_TOKEN=admin-secret sprig serve --tokens tokens.json repo.sprig
+```
+
+A scoped token can read everything but can only `land`, and only under its
+directories. Moving refs directly (`push`) is refused, because that could
+carry changes to any path. `SPRIG_TOKEN` stays full access.
 
 ### Pushing to GitHub (or any git host)
 
@@ -149,7 +193,7 @@ store.go      objects, refs, HEAD, operation log, config, revision parsing
 tree.go       trees, flattening, working-tree snapshot/materialize, ignore
 diff.go       LCS line diff, unified diff, three-way merge
 merge.go      history walking, merge base, tree merge, commit/merge/checkout/undo
-server.go     HTTP API, policy gate, push/fetch client
+server.go     HTTP API, landing, scoped tokens, cache tier, push/fetch client
 gitimport.go  git -> sprig converter (via `git cat-file --batch`)
 gitexport.go  sprig -> git converter (via `git fast-import`)
 main.go       CLI
@@ -175,9 +219,12 @@ afterwards `status` takes 8 ms and `log` 4 ms.
 - No rename detection, no partial checkout.
 - **Export re-streams every sprig-made change each run.** The output is
   identical so nothing new lands in git, but it costs time on long histories.
-- **Landing is one server process.** The ref lock is in memory and there are
-  no caches or replicas. Each attempt re-reads the whole tip tree, which is
-  fine for thousands of files but not for a monorepo.
-- **No per-directory permissions** yet; one token can land anywhere.
+- **Servers must share a disk.** The ref lock is a Unix file lock, so
+  multiple servers need the same local filesystem. Machines on separate
+  disks would need a shared lock or database (Scion uses Spanner).
+- **Permissions restrict writes only.** Any valid token can read the whole
+  repository.
+- **Partial clones can't widen.** To change `--path`, clone again. A merge
+  conflict in a file outside the view is recorded but not visible on disk.
 - **Diverged branches don't sync.** If GitHub and sprig both moved a branch,
   `import-git` skips it; there's no fetch-into-a-side-branch to merge from yet.

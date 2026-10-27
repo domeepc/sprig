@@ -48,6 +48,7 @@ func usage() {
 usage: sprig <command> [flags] [args]     (flags go before positional args)
 
   init [--bare] [-b branch] [dir]     create a repository
+  clone [-b branch] [--path dir]... <url> <dir>   lazy (and optionally sparse) working copy
   commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]...
   status [--json]                     working tree vs HEAD, pending conflicts
   log [-n N] [--agent A] [--json] [rev]
@@ -65,10 +66,11 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   push [-f] [remote] [branch]    fetch [remote] [branch]    pull [remote] [branch]
   land -m msg [--intent s] [--check k=v]... [remote] [branch]
                                       send working-tree edits; the server rebases and lands them
-  serve [--addr host:port] [--token t] [dir]
+  serve [--addr host:port] [--token t] [--tokens file] [--upstream url] [dir]
   import-git <path-to-git-repo>       convert a git repository's branches
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
+  sparse [path...]                    show or change which paths are checked out (none = all)
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN
 `)
@@ -120,6 +122,8 @@ func run(cmd string, args []string) error {
 		return cmdInit(args)
 	case "serve":
 		return cmdServe(args)
+	case "clone":
+		return cmdClone(args)
 	}
 	r, err := FindRepo()
 	if err != nil {
@@ -168,6 +172,8 @@ func run(cmd string, args []string) error {
 		return cmdExportGit(r, args)
 	case "cat":
 		return cmdCat(r, args)
+	case "sparse":
+		return cmdSparse(r, args)
 	}
 	usage()
 	return &exitError{2, fmt.Sprintf("unknown command %q", cmd)}
@@ -195,6 +201,64 @@ func cmdInit(args []string) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "initialized empty sprig repository in %s\n", r.Dir)
+	return nil
+}
+
+// cmdClone makes a lazy working copy: history and directory trees are
+// downloaded, file contents only when first read, and --path limits which
+// files are written to disk at all.
+func cmdClone(args []string) error {
+	fs := newFlags("clone")
+	branch := fs.String("b", "main", "branch to check out")
+	var paths multiFlag
+	fs.Var(&paths, "path", "only check out this directory or file (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: clone [-b branch] [--path dir]... <url> <dir>")
+	}
+	var sparse []string
+	for _, p := range paths {
+		p = strings.Trim(p, "/")
+		if !validPath(p) {
+			return fmt.Errorf("bad path %q", p)
+		}
+		sparse = append(sparse, p)
+	}
+	if err := os.MkdirAll(fs.Arg(1), 0o755); err != nil {
+		return err
+	}
+	abs, _ := filepath.Abs(fs.Arg(1))
+	r, err := InitRepo(abs, false, *branch)
+	if err != nil {
+		return err
+	}
+	cfg := r.LoadConfig()
+	cfg.Remotes["origin"] = strings.TrimRight(fs.Arg(0), "/")
+	cfg.Lazy, cfg.Sparse = "origin", sparse
+	if err := r.SaveConfig(cfg); err != nil {
+		return err
+	}
+	rm, err := r.Remote("origin")
+	if err != nil {
+		return err
+	}
+	tip, n, err := r.Fetch(rm, *branch)
+	if err != nil {
+		return err
+	}
+	flat, err := r.ChangeFlat(tip)
+	if err != nil {
+		return err
+	}
+	if err := r.Materialize(Flat{}, flat); err != nil {
+		return err
+	}
+	if err := r.WriteRef("heads/"+*branch, tip); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "cloned %s into %s (%d objects; file contents load on demand)\n", *branch, abs, n)
 	return nil
 }
 
@@ -280,6 +344,7 @@ func cmdStatus(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
+	deltas = withRenames(deltas)
 	var conflicts []Conflict
 	if head != "" {
 		c, err := r.GetChange(head)
@@ -292,10 +357,11 @@ func cmdStatus(r *Repo, args []string) error {
 		type ch struct {
 			Path string `json:"path"`
 			Kind string `json:"kind"`
+			From string `json:"from,omitempty"`
 		}
 		changes := []ch{}
 		for _, d := range deltas {
-			changes = append(changes, ch{d.Path, d.Kind})
+			changes = append(changes, ch{d.Path, d.Kind, d.From})
 		}
 		paths := []string{}
 		for _, c := range conflicts {
@@ -327,6 +393,10 @@ func cmdStatus(r *Repo, args []string) error {
 	}
 	fmt.Fprintln(stdout, "\nchanges since last change:")
 	for _, d := range deltas {
+		if d.Kind == "R" {
+			fmt.Fprintf(stdout, "  R %s -> %s\n", d.From, d.Path)
+			continue
+		}
 		fmt.Fprintf(stdout, "  %s %s\n", d.Kind, d.Path)
 	}
 	return nil
@@ -416,7 +486,14 @@ func cmdLog(r *Repo, args []string) error {
 func (r *Repo) diffBetween(a, b Flat) (string, error) {
 	var sb strings.Builder
 	read := func(fe FileEnt) ([]byte, error) { return r.GetBlob(fe.ID) }
-	for _, d := range DiffFlat(a, b) {
+	for _, d := range withRenames(DiffFlat(a, b)) {
+		if d.Kind == "R" {
+			fmt.Fprintf(&sb, "renamed: %s -> %s\n", d.From, d.Path)
+			if d.Old.Mode != d.New.Mode {
+				fmt.Fprintf(&sb, "mode change: %s %s -> %s\n", d.Path, d.Old.Mode, d.New.Mode)
+			}
+			continue
+		}
 		var od, nd []byte
 		var err error
 		if d.Kind != "A" {
@@ -1012,6 +1089,69 @@ func cmdExportGit(r *Repo, args []string) error {
 	return nil
 }
 
+// cmdSparse changes a working tree's view: files entering it are written
+// (loading content on demand in a lazy clone), files leaving it are removed.
+func cmdSparse(r *Repo, args []string) error {
+	cfg := r.LoadConfig()
+	if len(args) == 0 {
+		if len(cfg.Sparse) == 0 {
+			fmt.Fprintln(stdout, "(everything is checked out)")
+		}
+		for _, p := range cfg.Sparse {
+			fmt.Fprintln(stdout, p)
+		}
+		return nil
+	}
+	if r.Bare {
+		return errors.New("bare repository has no working tree")
+	}
+	next := cfg
+	next.Sparse = nil
+	for _, p := range args {
+		p = strings.Trim(p, "/")
+		if p == "." || p == "" {
+			next.Sparse = nil // "." means everything
+			break
+		}
+		if !validPath(p) {
+			return fmt.Errorf("bad path %q", p)
+		}
+		next.Sparse = append(next.Sparse, p)
+	}
+	_, head := r.Head()
+	hf, err := r.ChangeFlat(head)
+	if err != nil {
+		return err
+	}
+	if ok, d, err := r.workingMatches(hf); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("uncommitted changes (%d paths); commit them first", len(d))
+	}
+	added, removed := 0, 0
+	for p, fe := range hf {
+		switch was, now := cfg.inView(p), next.inView(p); {
+		case now && !was:
+			if err := r.writeFile(p, fe); err != nil {
+				return err
+			}
+			added++
+		case was && !now:
+			a := r.abs(p)
+			if err := os.Remove(a); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			r.pruneDirs(filepath.Dir(a))
+			removed++
+		}
+	}
+	if err := r.SaveConfig(next); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "checked out %d more file(s), removed %d\n", added, removed)
+	return nil
+}
+
 func cmdCat(r *Repo, args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: cat <id>")
@@ -1036,6 +1176,8 @@ func cmdServe(args []string) error {
 	fs := newFlags("serve")
 	addr := fs.String("addr", "127.0.0.1:7700", "listen address")
 	token := fs.String("token", os.Getenv("SPRIG_TOKEN"), "require this bearer token")
+	tokens := fs.String("tokens", "", `JSON file of scoped tokens: {"<token>": ["dir", ...]}`)
+	upstream := fs.String("upstream", "", "run as a cache in front of this sprig server")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1047,5 +1189,33 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	return serve(r, *addr, *token)
+	s := NewServer(r, *token)
+	if *tokens != "" {
+		b, err := os.ReadFile(*tokens)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &s.scopes); err != nil {
+			return fmt.Errorf("%s: %w", *tokens, err)
+		}
+		for tok, scope := range s.scopes {
+			if len(tok) < 16 {
+				return fmt.Errorf("%s: tokens must be at least 16 characters", *tokens)
+			}
+			for i, pre := range scope {
+				pre = strings.Trim(pre, "/")
+				if !validPath(pre) {
+					return fmt.Errorf("%s: bad path %q", *tokens, scope[i])
+				}
+				scope[i] = pre
+			}
+		}
+	}
+	if *upstream != "" {
+		if !r.Bare {
+			return errors.New("a cache needs its own bare repository (sprig init --bare cache.sprig)")
+		}
+		s.upstream = newRemote("upstream", *upstream)
+	}
+	return serve(s, *addr)
 }

@@ -157,6 +157,89 @@ func (r *Repo) writeNode(n *node) (string, error) {
 	return r.PutTree(t)
 }
 
+// lookup finds path p in a tree without flattening it ("" = empty tree).
+// A directory is returned with mode "dir".
+func (r *Repo) lookup(treeID, p string) (FileEnt, bool, error) {
+	for treeID != "" {
+		t, err := r.GetTree(treeID)
+		if err != nil {
+			return FileEnt{}, false, err
+		}
+		name, rest, deeper := strings.Cut(p, "/")
+		treeID = ""
+		for _, e := range t.Entries {
+			if e.Name != name {
+				continue
+			}
+			if !deeper {
+				return FileEnt{e.Mode, e.ID}, true, nil
+			}
+			if e.Mode == "dir" {
+				treeID, p = e.ID, rest
+			}
+			break
+		}
+	}
+	return FileEnt{}, false, nil
+}
+
+// updateTree returns treeID with the given paths set (nil removes one),
+// rewriting only the directories along those paths. Directories left empty
+// are dropped. Callers must not pass a path that is a directory.
+func (r *Repo) updateTree(treeID string, edits map[string]*FileEnt) (string, error) {
+	id, _, err := r.updateNode(treeID, edits)
+	return id, err
+}
+
+func (r *Repo) updateNode(treeID string, edits map[string]*FileEnt) (string, int, error) {
+	byName := map[string]Entry{}
+	if treeID != "" {
+		t, err := r.GetTree(treeID)
+		if err != nil {
+			return "", 0, err
+		}
+		for _, e := range t.Entries {
+			byName[e.Name] = e
+		}
+	}
+	sub := map[string]map[string]*FileEnt{}
+	for p, fe := range edits {
+		name, rest, deeper := strings.Cut(p, "/")
+		switch {
+		case deeper:
+			if sub[name] == nil {
+				sub[name] = map[string]*FileEnt{}
+			}
+			sub[name][rest] = fe
+		case fe == nil:
+			delete(byName, name)
+		default:
+			byName[name] = Entry{name, fe.Mode, fe.ID}
+		}
+	}
+	for name, ed := range sub {
+		e, ok := byName[name]
+		if ok && e.Mode != "dir" {
+			return "", 0, fmt.Errorf("path %q is both a file and a directory", name)
+		}
+		id, n, err := r.updateNode(e.ID, ed)
+		if err != nil {
+			return "", 0, err
+		}
+		if n == 0 {
+			delete(byName, name)
+		} else {
+			byName[name] = Entry{name, "dir", id}
+		}
+	}
+	t := &Tree{}
+	for _, e := range byName {
+		t.Entries = append(t.Entries, e)
+	}
+	id, err := r.PutTree(t)
+	return id, len(t.Entries), err
+}
+
 func (r *Repo) ChangeFlat(changeID string) (Flat, error) {
 	if changeID == "" {
 		return Flat{}, nil
@@ -173,26 +256,55 @@ func (r *Repo) ChangeFlat(changeID string) (Flat, error) {
 
 type Delta struct {
 	Path string
-	Kind string // A, M, D
+	Kind string // A, M, D, or R (renamed, for display only)
 	Old  FileEnt
 	New  FileEnt
+	From string // old path of a rename
 }
 
 func DiffFlat(a, b Flat) []Delta {
 	var out []Delta
 	for p, ae := range a {
 		if be, ok := b[p]; !ok {
-			out = append(out, Delta{p, "D", ae, FileEnt{}})
+			out = append(out, Delta{p, "D", ae, FileEnt{}, ""})
 		} else if ae != be {
-			out = append(out, Delta{p, "M", ae, be})
+			out = append(out, Delta{p, "M", ae, be, ""})
 		}
 	}
 	for p, be := range b {
 		if _, ok := a[p]; !ok {
-			out = append(out, Delta{p, "A", FileEnt{}, be})
+			out = append(out, Delta{p, "A", FileEnt{}, be, ""})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// withRenames pairs a deleted and an added file with identical content into
+// one rename. shortcut: exact-content renames only; similarity scoring would also catch rename+edit.
+func withRenames(ds []Delta) []Delta {
+	gone := map[string][]int{} // blob id -> indexes of deletions
+	for i, d := range ds {
+		if d.Kind == "D" {
+			gone[d.Old.ID] = append(gone[d.Old.ID], i)
+		}
+	}
+	drop := map[int]bool{}
+	for i, d := range ds {
+		if d.Kind != "A" || len(gone[d.New.ID]) == 0 {
+			continue
+		}
+		j := gone[d.New.ID][0]
+		gone[d.New.ID] = gone[d.New.ID][1:]
+		ds[i] = Delta{d.Path, "R", ds[j].Old, d.New, ds[j].Path}
+		drop[j] = true
+	}
+	out := ds[:0]
+	for i, d := range ds {
+		if !drop[i] {
+			out = append(out, d)
+		}
+	}
 	return out
 }
 
@@ -240,6 +352,7 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 		return nil, errors.New("bare repository has no working tree")
 	}
 	pats := r.loadIgnore()
+	cfg := r.LoadConfig()
 	flat := Flat{}
 	err := filepath.WalkDir(r.Root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -251,12 +364,12 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".sprig" || d.Name() == ".git" || ignored(pats, rel) {
+			if d.Name() == ".sprig" || d.Name() == ".git" || ignored(pats, rel) || !cfg.dirInView(rel) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if ignored(pats, rel) {
+		if ignored(pats, rel) || !cfg.inView(rel) {
 			return nil
 		}
 		info, err := d.Info()
@@ -295,15 +408,40 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 		flat[rel] = FileEnt{mode, id}
 		return nil
 	})
+	if err != nil || len(cfg.Sparse) == 0 {
+		return flat, err
+	}
+	// outside a sparse view, files are whatever HEAD says
+	_, head := r.Head()
+	hf, err := r.ChangeFlat(head)
+	for p, fe := range hf {
+		if !cfg.inView(p) {
+			flat[p] = fe
+		}
+	}
 	return flat, err
 }
 
+// dirInView reports whether a directory holds anything in the sparse view.
+func (c Config) dirInView(dir string) bool {
+	if c.inView(dir) {
+		return true
+	}
+	for _, pre := range c.Sparse {
+		if strings.HasPrefix(pre, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // Materialize makes the working tree match `to`, given that it currently
-// matches `from`. Ignored files are left alone.
+// matches `from`. Ignored files and files outside a sparse view are left alone.
 func (r *Repo) Materialize(from, to Flat) error {
+	cfg := r.LoadConfig()
 	var del []string
 	for p := range from {
-		if _, ok := to[p]; !ok {
+		if _, ok := to[p]; !ok && cfg.inView(p) {
 			del = append(del, p)
 		}
 	}
@@ -317,7 +455,9 @@ func (r *Repo) Materialize(from, to Flat) error {
 	}
 	paths := make([]string, 0, len(to))
 	for p := range to {
-		paths = append(paths, p)
+		if cfg.inView(p) {
+			paths = append(paths, p)
+		}
 	}
 	sort.Strings(paths)
 	for _, p := range paths {

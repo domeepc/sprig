@@ -759,3 +759,169 @@ func TestLand(t *testing.T) {
 		t.Fatalf("history has %d changes, want 23 linear", n)
 	}
 }
+
+// seedServer starts a server over a bare repo holding a.txt and d/x.txt on main.
+func seedServer(t *testing.T, s *Server) (string, *Repo) {
+	t.Helper()
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	newRepo(t)
+	must(t, "remote", "add", "origin", ts.URL)
+	write(t, "a.txt", "a\n")
+	write(t, "d/x.txt", "x\n")
+	must(t, "commit", "-m", "seed")
+	must(t, "push")
+	return ts.URL, s.repo
+}
+
+func land(t *testing.T, url, token string, files map[string]*LandFile) error {
+	t.Helper()
+	rm := newRemote("t", url)
+	rm.Token = token
+	refs, err := rm.Refs()
+	if err != nil {
+		return err
+	}
+	_, err = rm.Land(&LandRequest{Branch: "main", Base: refs["heads/main"], Message: "m", Files: files})
+	return err
+}
+
+func TestLandPaths(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, repo := seedServer(t, NewServer(srv, ""))
+	f := &LandFile{Mode: "file", Data: []byte("y\n")}
+	if err := land(t, url, "", map[string]*LandFile{"a.txt/y": f}); err == nil {
+		t.Fatal("file used as a directory accepted")
+	}
+	if err := land(t, url, "", map[string]*LandFile{"d": f}); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("directory overwritten by a file: %v", err)
+	}
+	if err := land(t, url, "", map[string]*LandFile{"d/x.txt": nil, "e/f/g.txt": f}); err != nil {
+		t.Fatal(err)
+	}
+	tip, _ := repo.ReadRef("heads/main")
+	flat, _ := repo.ChangeFlat(tip)
+	if _, ok := flat["d/x.txt"]; ok || len(flat) != 2 || flat["e/f/g.txt"].ID == "" {
+		t.Fatalf("tree after land: %v", flat)
+	}
+	c, _ := repo.GetChange(tip)
+	if root, _ := repo.GetTree(c.Tree); len(root.Entries) != 2 { // empty d/ dropped
+		t.Fatalf("root entries: %+v", root.Entries)
+	}
+}
+
+func TestScopedTokens(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	s := NewServer(srv, "full-access-token")
+	s.scopes = map[string][]string{"docs-only-token-123": {"d"}}
+	t.Setenv("SPRIG_TOKEN", "full-access-token")
+	url, _ := seedServer(t, s)
+	f := &LandFile{Mode: "file", Data: []byte("new\n")}
+	if err := land(t, url, "docs-only-token-123", map[string]*LandFile{"d/x.txt": f}); err != nil {
+		t.Fatalf("in-scope land refused: %v", err)
+	}
+	if err := land(t, url, "docs-only-token-123", map[string]*LandFile{"a.txt": f}); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("out-of-scope land: %v", err)
+	}
+	if err := land(t, url, "docs-only-token-123", map[string]*LandFile{"dx.txt": f}); err == nil {
+		t.Fatal("prefix matched a sibling name")
+	}
+	rm := newRemote("t", url)
+	rm.Token = "docs-only-token-123"
+	if err := rm.UpdateRef("heads/main", "", "", true); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("scoped token moved a ref: %v", err)
+	}
+	if err := land(t, url, "wrong", map[string]*LandFile{"d/x.txt": f}); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("bad token: %v", err)
+	}
+}
+
+func TestTwoServersOneRepo(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url1, repo := seedServer(t, NewServer(srv, ""))
+	ts2 := httptest.NewServer(NewServer(&Repo{Dir: srv.Dir, Bare: true}, "").Handler())
+	defer ts2.Close()
+	errs := make(chan error, 20)
+	for i := range 20 {
+		url := url1
+		if i%2 == 1 {
+			url = ts2.URL
+		}
+		go func() {
+			errs <- land(t, url, "", map[string]*LandFile{fmt.Sprintf("n/%d", i): {Mode: "file", Data: []byte{byte(i)}}})
+		}()
+	}
+	for range 20 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	tip, _ := repo.ReadRef("heads/main")
+	if flat, _ := repo.ChangeFlat(tip); len(flat) != 22 {
+		t.Fatalf("lost landings across servers: %d files", len(flat))
+	}
+}
+
+func TestCacheServer(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, repo := seedServer(t, NewServer(srv, ""))
+	cacheRepo, _ := InitRepo(t.TempDir(), true, "main")
+	cache := NewServer(cacheRepo, "")
+	cache.upstream = newRemote("upstream", url)
+	cts := httptest.NewServer(cache.Handler())
+	defer cts.Close()
+
+	t.Chdir(t.TempDir())
+	must(t, "clone", cts.URL, "w")
+	t.Chdir("w")
+	if read(t, "d/x.txt") != "x\n" {
+		t.Fatal("clone through cache failed")
+	}
+	tip, _ := repo.ReadRef("heads/main")
+	if !cacheRepo.HasObject(tip) {
+		t.Fatal("cache did not keep the change")
+	}
+	write(t, "a.txt", "via cache\n")
+	must(t, "land", "-m", "through cache")
+	newTip, _ := repo.ReadRef("heads/main")
+	if flat, _ := repo.ChangeFlat(newTip); flat["a.txt"].ID != HashObject(TypeBlob, []byte("via cache\n")) {
+		t.Fatal("land through cache did not reach upstream")
+	}
+}
+
+func TestLazySparseClone(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, repo := seedServer(t, NewServer(srv, ""))
+	t.Chdir(t.TempDir())
+	must(t, "clone", "--path", "d", url, "w")
+	t.Chdir("w")
+	if _, err := os.Stat("a.txt"); err == nil {
+		t.Fatal("file outside --path was checked out")
+	}
+	r, _ := FindRepo()
+	if r.HasObject(HashObject(TypeBlob, []byte("a\n"))) {
+		t.Fatal("blob outside the view was downloaded")
+	}
+	if out := must(t, "status"); strings.Contains(out, "a.txt") {
+		t.Fatalf("file outside view shows as changed: %s", out)
+	}
+	// reading history outside the view fetches on demand
+	if out := must(t, "show", "HEAD"); !strings.Contains(out, "+a") {
+		t.Fatalf("show did not load a.txt lazily: %s", out)
+	}
+	write(t, "d/x.txt", "x2\n")
+	must(t, "land", "-m", "sparse edit")
+	tip, _ := repo.ReadRef("heads/main")
+	flat, _ := repo.ChangeFlat(tip)
+	if len(flat) != 2 || flat["d/x.txt"].ID != HashObject(TypeBlob, []byte("x2\n")) {
+		t.Fatalf("server tree after sparse land: %v", flat)
+	}
+	// commit + push from a lazy clone works without downloading everything
+	write(t, "d/y.txt", "y\n")
+	must(t, "commit", "-m", "local")
+	must(t, "push")
+	tip, _ = repo.ReadRef("heads/main")
+	if flat, _ := repo.ChangeFlat(tip); flat["a.txt"].ID == "" || flat["d/y.txt"].ID == "" {
+		t.Fatalf("push from sparse clone lost files: %v", flat)
+	}
+}

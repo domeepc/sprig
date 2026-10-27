@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -26,8 +29,14 @@ type exporter struct {
 	next    int
 	blobs   map[string]int    // sprig blob id -> fast-import mark
 	commits map[string]string // sprig change id -> git sha or ":mark"
+	known   map[string]string // sprig change id -> git sha from earlier exports
+	marks   map[int]string    // fast-import mark -> sprig change id
 	res     *ExportResult
 }
+
+// The commit an exported change became is the same in every git repo (export
+// is deterministic), so one map per sprig repo lets later exports stop there.
+func (r *Repo) gitMapPath() string { return filepath.Join(r.Dir, "git-exported.json") }
 
 // ExportGit writes every sprig branch into a git repository via
 // `git fast-import`, so it can be pushed with git. Changes that came from git
@@ -52,7 +61,17 @@ func (r *Repo) ExportGit(gitDir string, force bool) (*ExportResult, error) {
 	sort.Strings(names)
 
 	gitOutput(gitDir, "update-ref", "-d", exportRef) // leftover from a failed run
-	args := []string{"-C", gitDir, "fast-import", "--quiet"}
+	known := map[string]string{}
+	if b, err := os.ReadFile(r.gitMapPath()); err == nil {
+		json.Unmarshal(b, &known)
+	}
+	marksFile, err := os.CreateTemp("", "sprig-marks-*")
+	if err != nil {
+		return nil, err
+	}
+	marksFile.Close()
+	defer os.Remove(marksFile.Name())
+	args := []string{"-C", gitDir, "fast-import", "--quiet", "--export-marks=" + marksFile.Name()}
 	if force {
 		args = append(args, "--force")
 	}
@@ -67,7 +86,7 @@ func (r *Repo) ExportGit(gitDir string, force bool) (*ExportResult, error) {
 		return nil, fmt.Errorf("cannot run git: %w", err)
 	}
 	ex := &exporter{r: r, dir: gitDir, w: bufio.NewWriterSize(in, 1<<20), res: res,
-		blobs: map[string]int{}, commits: map[string]string{}}
+		blobs: map[string]int{}, commits: map[string]string{}, known: known, marks: map[int]string{}}
 	var exported []string
 	streamErr := func() error {
 		for _, b := range names {
@@ -98,6 +117,18 @@ func (r *Repo) ExportGit(gitDir string, force bool) (*ExportResult, error) {
 	if streamErr != nil {
 		return nil, streamErr
 	}
+	if b, err := os.ReadFile(marksFile.Name()); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			var m int
+			var sha string
+			if _, err := fmt.Sscanf(line, ":%d %s", &m, &sha); err == nil && ex.marks[m] != "" {
+				known[ex.marks[m]] = sha
+			}
+		}
+		if b, err := json.Marshal(known); err == nil {
+			atomicWrite(r.gitMapPath(), b)
+		}
+	}
 	for _, b := range exported {
 		sha, err := gitOutput(gitDir, "rev-parse", "refs/heads/"+b)
 		if err != nil {
@@ -123,10 +154,13 @@ func (ex *exporter) export(id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// shortcut: sprig-made changes are re-streamed on every export (same output, so harmless); record change->sha if exports get slow.
-	if c.Meta.GitSHA != "" && exec.Command("git", "-C", ex.dir, "cat-file", "-e", c.Meta.GitSHA+"^{commit}").Run() == nil {
-		ex.commits[id] = c.Meta.GitSHA
-		return c.Meta.GitSHA, nil
+	sha := c.Meta.GitSHA
+	if sha == "" {
+		sha = ex.known[id]
+	}
+	if sha != "" && exec.Command("git", "-C", ex.dir, "cat-file", "-e", sha+"^{commit}").Run() == nil {
+		ex.commits[id] = sha
+		return sha, nil
 	}
 	var parents []string
 	for _, p := range c.Parents {
@@ -194,6 +228,7 @@ func (ex *exporter) export(id string) (string, error) {
 	ex.w.WriteString("\n")
 	ref := fmt.Sprintf(":%d", m)
 	ex.commits[id] = ref
+	ex.marks[m] = id
 	ex.res.Commits++
 	return ref, nil
 }

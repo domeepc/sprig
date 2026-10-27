@@ -151,7 +151,11 @@ func (r *Repo) ImportGit(gitDir string, force bool) (*ImportResult, error) {
 			name := "heads/" + b.name
 			if cur, ok := r.ReadRef(name); ok && !force {
 				if ff, err := r.IsAncestor(cur, id); err != nil || !ff {
-					res.Warnings = append(res.Warnings, fmt.Sprintf("branch %q exists with different history; skipped (use --force to overwrite)", b.name))
+					// diverged: keep git's side as git/<branch> so it can be merged
+					if err := r.WriteRef("remotes/git/"+b.name, id); err != nil {
+						return err
+					}
+					res.Warnings = append(res.Warnings, fmt.Sprintf("branch %q has diverged; git's version is at git/%s (run `sprig merge git/%s`, or --force to overwrite)", b.name, b.name, b.name))
 					continue
 				}
 			}
