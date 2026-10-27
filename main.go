@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,12 @@ func main() {
 	}
 	if os.Args[1] != "serve" {
 		debug.SetGCPercent(400) // short-lived commands: trade a little memory for less GC time
+	}
+	if p := os.Getenv("SPRIG_CPUPROFILE"); p != "" { // for finding what a command spends its time on
+		if f, err := os.Create(p); err == nil {
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
 	}
 	err := run(os.Args[1], os.Args[2:])
 	if err != nil {
@@ -56,7 +63,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   clone [-b branch] [--path dir]... <url> <dir>   lazy (and optionally sparse) working copy
   commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]... [--hunk path:N]... [path...]
   status [--json] [-M pct]            working tree vs HEAD, pending conflicts
-  log [-n N] [--agent A] [--json] [rev]
+  log [-n N] [--agent A] [--signatures] [--json] [rev]
   show [-M pct] [rev]                 a change and its diff (-M: rename similarity, default 50)
   diff [-M pct] [revA [revB]]         working tree vs HEAD, or between two revs
   branch [-d] [name [start]]          list, create or delete branches
@@ -410,11 +417,7 @@ func cmdStatus(r *Repo, args []string) error {
 		return err
 	}
 	ref, head := r.Head()
-	headFlat, err := r.ChangeFlat(head)
-	if err != nil {
-		return err
-	}
-	_, deltas, err := r.workingMatches(headFlat)
+	deltas, err := r.statusDeltas(head)
 	if err != nil {
 		return err
 	}
@@ -484,7 +487,7 @@ func fmtTime(c *Change) string {
 	return time.Unix(c.Time, 0).Format("Mon Jan 2 15:04:05 2006 ") + c.TZ
 }
 
-func printChangeHeader(r *Repo, id string, c *Change) {
+func printChangeHeader(r *Repo, id string, c *Change, sigs bool) {
 	tag := ""
 	if len(c.Parents) > 1 {
 		tag = " (merge)"
@@ -516,7 +519,7 @@ func printChangeHeader(r *Repo, id string, c *Change) {
 	if c.Projected != "" {
 		fmt.Fprintf(stdout, "Projected from %s (a read-scoped view of that change)\n", short(c.Projected))
 	}
-	if c.Sig != nil {
+	if c.Sig != nil && sigs {
 		key, err := r.VerifyChange(c)
 		who := key
 		if name, ok := r.LoadConfig().Trusted[key]; ok {
@@ -539,6 +542,7 @@ func cmdLog(r *Repo, args []string) error {
 	n := fs.Int("n", 20, "max changes")
 	agent := fs.String("agent", "", "only changes by this agent")
 	asJSON := fs.Bool("json", false, "machine-readable output")
+	sigs := fs.Bool("signatures", false, "check and show signatures (slower; show always does)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -571,15 +575,31 @@ func cmdLog(r *Repo, args []string) error {
 		return printJSON(items)
 	}
 	for _, it := range items {
-		printChangeHeader(r, it.ID, it.Change)
+		printChangeHeader(r, it.ID, it.Change, *sigs)
 	}
 	return nil
 }
 
 func (r *Repo) diffBetween(a, b Flat, sim int) (string, error) {
+	return r.renderDiff(DiffFlat(a, b), sim)
+}
+
+// treeOfRev is the tree of a change ("" for none).
+func (r *Repo) treeOfRev(id string) (string, error) {
+	if id == "" {
+		return "", nil
+	}
+	c, err := r.GetChange(id)
+	if err != nil {
+		return "", err
+	}
+	return c.Tree, nil
+}
+
+func (r *Repo) renderDiff(ds []Delta, sim int) (string, error) {
 	var sb strings.Builder
 	read := func(fe FileEnt) ([]byte, error) { return r.GetBlob(fe.ID) }
-	for _, d := range r.withRenamesAt(DiffFlat(a, b), sim) {
+	for _, d := range r.withRenamesAt(ds, sim) {
 		if d.Kind == "R" {
 			fmt.Fprintf(&sb, "renamed: %s -> %s\n", d.From, d.Path)
 			if d.Old.Mode != d.New.Mode {
@@ -643,20 +663,20 @@ func cmdShow(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
-	printChangeHeader(r, id, c)
+	printChangeHeader(r, id, c, true)
 	var parent string
 	if len(c.Parents) > 0 {
 		parent = c.Parents[0]
 	}
-	a, err := r.ChangeFlat(parent)
+	pt, err := r.treeOfRev(parent)
 	if err != nil {
 		return err
 	}
-	b, err := r.Flatten(c.Tree)
+	ds, err := r.DiffTrees(pt, c.Tree)
 	if err != nil {
 		return err
 	}
-	out, err := r.diffBetween(a, b, *sim)
+	out, err := r.renderDiff(ds, *sim)
 	fmt.Fprint(stdout, out)
 	return err
 }
@@ -684,18 +704,28 @@ func cmdDiff(r *Repo, args []string) error {
 		if err != nil {
 			return err
 		}
-		if a, err = r.ChangeFlat(ida); err != nil {
-			return err
-		}
 		if len(args) == 2 {
 			idb, err := r.ResolveRev(args[1])
 			if err != nil {
 				return err
 			}
-			if b, err = r.ChangeFlat(idb); err != nil {
+			ta, err1 := r.treeOfRev(ida)
+			tb, err2 := r.treeOfRev(idb)
+			if err := errors.Join(err1, err2); err != nil {
 				return err
 			}
-		} else if b, err = r.Snapshot(true); err != nil {
+			ds, err := r.DiffTrees(ta, tb) // two revisions: only changed directories are read
+			if err != nil {
+				return err
+			}
+			out, err := r.renderDiff(ds, *sim)
+			fmt.Fprint(stdout, out)
+			return err
+		}
+		if a, err = r.ChangeFlat(ida); err != nil {
+			return err
+		}
+		if b, err = r.Snapshot(true); err != nil {
 			return err
 		}
 	default:
