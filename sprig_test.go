@@ -1745,3 +1745,67 @@ func TestStandbyLongPollReflogFailover(t *testing.T) {
 		t.Fatal("clone from standby is stale")
 	}
 }
+
+func TestTreeSitterMerge(t *testing.T) {
+	cases := []struct {
+		file, base, ours, theirs string
+		want                     []string
+	}{
+		{"m.py",
+			"import os\n\n\ndef a():\n    return 1\n",
+			"import os\nimport sys\n\n\ndef a():\n    return 1\n\n\ndef b():\n    return sys.argv\n",
+			"import os\nimport json\n\n\ndef a():\n    return 1\n\n\ndef c():\n    return json.dumps({})\n",
+			[]string{"import sys", "import json", "def b()", "def c()"}},
+		{"m.js",
+			"import a from 'a';\n\nfunction one() { return 1; }\n",
+			"import a from 'a';\nimport b from 'b';\n\nfunction one() { return 1; }\n\nfunction two() { return b; }\n",
+			"import a from 'a';\nimport c from 'c';\n\nfunction one() { return 1; }\n\nexport const three = c;\n",
+			[]string{"import b from 'b'", "import c from 'c'", "function two()", "export const three"}},
+		{"m.ts",
+			"export interface A { x: number }\n",
+			"export interface A { x: number }\n\nexport type B = string;\n",
+			"export interface A { x: number }\n\nexport function c(): number { return 1; }\n",
+			[]string{"type B", "function c()"}},
+		{"m.rs",
+			"use std::io;\n\nfn a() {}\n",
+			"use std::io;\nuse std::fs;\n\nfn a() {}\n\nfn b() {}\n",
+			"use std::io;\nuse std::env;\n\nfn a() {}\n\n#[test]\nfn c() {}\n",
+			[]string{"use std::fs;", "use std::env;", "fn b()", "#[test]\nfn c()"}},
+		{"M.java",
+			"package p;\n\nimport java.util.List;\n\nclass M {\n    int a() { return 1; }\n}\n",
+			"package p;\n\nimport java.util.List;\nimport java.util.Map;\n\nclass M {\n    int a() { return 1; }\n\n    int b() { return 2; }\n}\n",
+			"package p;\n\nimport java.util.List;\nimport java.util.Set;\n\nclass M {\n    int a() { return 1; }\n\n    int c() { return 3; }\n}\n",
+			[]string{"import java.util.Map;", "import java.util.Set;", "int b()", "int c()"}},
+		{"k.py", // members of one class, changed on both sides
+			"class K:\n    def a(self):\n        return 1\n\n    def b(self):\n        return 2\n",
+			"class K:\n    def a(self):\n        return 10\n\n    def b(self):\n        return 2\n",
+			"class K:\n    def a(self):\n        return 1\n\n    def b(self):\n        return 20\n\n    def c(self):\n        return 3\n",
+			[]string{"return 10", "return 20", "def c(self)"}},
+	}
+	for _, c := range cases {
+		lines := Merge3(splitLines([]byte(c.base)), splitLines([]byte(c.ours)), splitLines([]byte(c.theirs)), "o", "t")
+		got, ok := codeMerge(c.file, []byte(c.base), []byte(c.ours), []byte(c.theirs))
+		if !ok {
+			t.Errorf("%s: structural merge gave up (line merge conflicts: %d)", c.file, lines.Conflicts)
+			continue
+		}
+		for _, w := range c.want {
+			if !strings.Contains(string(got), w) {
+				t.Errorf("%s: result lacks %q:\n%s", c.file, w, got)
+			}
+		}
+	}
+	// the same function changed incompatibly still conflicts
+	b := "def f():\n    return 1\n"
+	if _, ok := codeMerge("x.py", []byte(b), []byte("def f():\n    return 2\n"), []byte("def f():\n    return 3\n")); ok {
+		t.Error("conflicting edits to one Python function merged")
+	}
+	jb := "class M {\n    int a() { return 1; }\n}\n"
+	if _, ok := codeMerge("M.java", []byte(jb), []byte(strings.Replace(jb, "1", "2", 1)), []byte(strings.Replace(jb, "1", "3", 1))); ok {
+		t.Error("conflicting edits to one Java method merged")
+	}
+	// unknown language: no structural merge
+	if _, ok := codeMerge("x.txt", []byte("a\n"), []byte("b\n"), []byte("c\n")); ok {
+		t.Error("plain text was merged structurally")
+	}
+}
