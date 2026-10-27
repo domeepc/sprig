@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,9 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
+	}
+	if os.Args[1] != "serve" {
+		debug.SetGCPercent(400) // short-lived commands: trade a little memory for less GC time
 	}
 	err := run(os.Args[1], os.Args[2:])
 	if err != nil {
@@ -74,6 +78,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
   gc                                  pack loose objects, with deltas between file versions
+  watch                               keep a list of changed files so status needn't stat every file
   sparse [path... | .]                 show or change which paths are checked out (. = all)
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
@@ -187,6 +192,10 @@ func run(cmd string, args []string) error {
 		return cmdSparse(r, args)
 	case "trust":
 		return cmdTrust(r, args)
+	case "watch":
+		return r.Watch(nil, func() {
+			fmt.Fprintf(stdout, "watching %s; status and commit now ask this process (Ctrl-C to stop)\n", r.Root)
+		})
 	case "gc":
 		res, err := r.GC()
 		if err != nil {
