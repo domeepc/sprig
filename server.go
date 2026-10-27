@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,11 +32,26 @@ type Server struct {
 	token    string           // full access
 	scopes   map[string]Scope // limited tokens
 	upstream *Remote          // set when this server is a cache in front of another
+	follow   *Remote          // set when this server is a read-only standby of another
+
+	stopOnce sync.Once
+	stop     chan struct{} // closed by Stop: ends long-polls and followers
+
+	refsMu  sync.Mutex
+	refsCh  chan struct{}     // closed when refs change (long-poll wake-up)
+	upRefs  map[string]string // a cache's copy of upstream refs, kept by followUpstream
+	upFresh bool
 }
 
 const maxObjectSize = 256 << 20
 
-func NewServer(r *Repo, token string) *Server { return &Server{repo: r, token: token} }
+func NewServer(r *Repo, token string) *Server {
+	return &Server{repo: r, token: token, stop: make(chan struct{})}
+}
+
+// Stop ends long-polls and background followers, so the HTTP server can
+// shut down without waiting for them.
+func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.stop) }) }
 
 type scopeKey struct{}
 
@@ -99,14 +116,29 @@ func (s *Server) Handler() http.Handler {
 		// Cache tier: objects never change, so they are served locally once
 		// fetched; everything else (refs, landing, log, ...) goes upstream.
 		s.repo.fallback = s.upstream
-		u, _ := url.Parse(s.upstream.URL)
-		mux.Handle("/v1/", &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(u) }})
+		up := s.upstream
+		mux.Handle("/v1/", &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				u, _ := url.Parse(up.base())
+				pr.SetURL(u)
+			},
+			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+				up.failedOver(req.URL.Scheme + "://" + req.URL.Host)
+				httpErr(w, 502, "upstream: %v", err)
+			},
+		})
+		go s.followUpstream()
 		mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 		mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
 		mux.HandleFunc("POST /v1/objects/get", s.handleGetObjects)
 		mux.HandleFunc("POST /v1/land", s.handleLand) // merge here; only the ref swap goes upstream
 		return s.auth(mux)
 	}
+	defer func() {
+		if s.follow != nil {
+			go s.runFollow()
+		}
+	}()
 	mux.HandleFunc("GET /v1/refs", s.handleRefs)
 	mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 	mux.HandleFunc("PUT /v1/object/{id}", s.handlePutObject)
@@ -119,6 +151,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
 	mux.HandleFunc("GET /v1/file", s.handleFile)
 	mux.HandleFunc("GET /v1/ls", s.handleLs)
+	if s.follow != nil {
+		return s.auth(s.readOnly(mux))
+	}
 	return s.auth(mux)
 }
 
@@ -151,10 +186,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
-}
-
-func (s *Server) handleRefs(w http.ResponseWriter, req *http.Request) {
-	writeJSON(w, 200, map[string]any{"refs": s.repo.ListRefs()})
 }
 
 // fill copies an object from upstream into a cache server's store.
@@ -281,6 +312,7 @@ func (s *Server) handleUpdateRef(w http.ResponseWriter, req *http.Request) {
 			httpErr(w, 500, "%v", err)
 			return
 		}
+		s.logRef(reflogEntry{Ref: name, Old: cur, Via: "delete", Who: tokenKind(req)})
 		writeJSON(w, 200, map[string]string{"ok": "deleted"})
 		return
 	}
@@ -311,6 +343,7 @@ func (s *Server) handleUpdateRef(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 500, "%v", err)
 		return
 	}
+	s.logRef(reflogEntry{Ref: name, Old: cur, New: u.New, Via: "push", Who: tokenKind(req)})
 	writeJSON(w, 200, map[string]string{"ok": "updated"})
 }
 
@@ -537,7 +570,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 		}
-		raced, err := s.swapRef(name, tip, id)
+		raced, err := s.swapRef(name, tip, id, u.Author)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -569,6 +602,9 @@ func (s *Server) readRef(name string) (string, error) {
 		id, _ := s.repo.ReadRef(name)
 		return id, nil
 	}
+	if id, ok := s.upRef(name); ok {
+		return id, nil
+	}
 	refs, err := s.upstream.Refs()
 	return refs[name], err
 }
@@ -576,12 +612,16 @@ func (s *Server) readRef(name string) (string, error) {
 // swapRef moves name from old to new, reporting moved=true if it no longer
 // pointed at old. A cache sends this one compare-and-swap upstream; it is the
 // only step of a landing that the authoritative server has to do itself.
-func (s *Server) swapRef(name, old, new string) (moved bool, err error) {
+func (s *Server) swapRef(name, old, new, who string) (moved bool, err error) {
 	if s.upstream != nil {
 		err := s.upstream.UpdateRef(name, old, new, false)
 		var re *remoteError
 		if errors.As(err, &re) && re.Code == 409 && strings.HasPrefix(re.Msg, "ref moved") {
+			s.setUpRef(name, "", false) // our copy is stale: ask upstream next time
 			return true, nil
+		}
+		if err == nil {
+			s.setUpRef(name, new, true)
 		}
 		return false, err
 	}
@@ -593,7 +633,30 @@ func (s *Server) swapRef(name, old, new string) (moved bool, err error) {
 	if cur, _ := s.repo.ReadRef(name); cur != old {
 		return true, nil
 	}
-	return false, s.repo.WriteRef(name, new)
+	if err := s.repo.WriteRef(name, new); err != nil {
+		return false, err
+	}
+	s.logRef(reflogEntry{Ref: name, Old: old, New: new, Via: "land", Who: who})
+	return false, nil
+}
+
+// logRef records a ref change; called with the ref lock held. A failure to
+// log does not undo the change, but is reported on stderr.
+func (s *Server) logRef(e reflogEntry) {
+	if err := s.repo.appendReflog(e); err != nil {
+		fmt.Fprintf(os.Stderr, "sprig: reflog: %v\n", err)
+	}
+	s.notifyRefs()
+}
+
+func tokenKind(req *http.Request) string {
+	if _, scoped := scopeOf(req); scoped {
+		return "scoped token"
+	}
+	if req.Header.Get("Authorization") != "" {
+		return "full token"
+	}
+	return "no token"
 }
 
 // publish uploads what a landing created (the edited files, the directories
@@ -782,9 +845,11 @@ func (s *Server) handleLs(w http.ResponseWriter, req *http.Request) {
 
 type Remote struct {
 	Name  string
-	URL   string
+	URL   string // the first server; base() is the one in use
 	Token string
 	hc    *http.Client
+	urls  []string // all servers to try, in order (a comma-separated URL)
+	cur   int32    // index into urls, changed atomically
 }
 
 func (r *Repo) Remote(name string) (*Remote, error) {
@@ -796,29 +861,64 @@ func (r *Repo) Remote(name string) (*Remote, error) {
 	return newRemote(name, u), nil
 }
 
+// newRemote makes a client for one server, or for several given as a
+// comma-separated list: requests go to the first that answers.
 func newRemote(name, u string) *Remote {
-	return &Remote{Name: name, URL: strings.TrimRight(u, "/"), Token: os.Getenv("SPRIG_TOKEN"),
-		hc: &http.Client{Timeout: 5 * time.Minute}}
+	var urls []string
+	for _, one := range strings.Split(u, ",") {
+		if one = strings.TrimRight(strings.TrimSpace(one), "/"); one != "" {
+			urls = append(urls, one)
+		}
+	}
+	if len(urls) == 0 {
+		urls = []string{""}
+	}
+	return &Remote{Name: name, URL: urls[0], Token: os.Getenv("SPRIG_TOKEN"),
+		hc: &http.Client{Timeout: 5 * time.Minute}, urls: urls}
+}
+
+// base is the server to use now.
+func (rm *Remote) base() string {
+	if len(rm.urls) == 0 {
+		return rm.URL
+	}
+	return rm.urls[int(atomic.LoadInt32(&rm.cur))%len(rm.urls)]
+}
+
+// failedOver moves on to the next server after one did not answer.
+func (rm *Remote) failedOver(from string) {
+	if len(rm.urls) > 1 && rm.base() == from {
+		atomic.AddInt32(&rm.cur, 1)
+	}
 }
 
 func (rm *Remote) do(method, path string, body []byte, hdr map[string]string) ([]byte, http.Header, error) {
-	req, err := http.NewRequest(method, rm.URL+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, err
-	}
-	if rm.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+rm.Token)
-	}
-	for k, v := range hdr {
-		req.Header.Set(k, v)
-	}
-	resp, err := rm.hc.Do(req)
-	if err != nil {
-		return nil, nil, err
+	var resp *http.Response
+	var base string
+	tries := max(len(rm.urls), 1)
+	for try := 0; ; try++ {
+		base = rm.base()
+		req, err := http.NewRequest(method, base+path, bytes.NewReader(body))
+		if err != nil {
+			return nil, nil, err
+		}
+		if rm.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+rm.Token)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		if resp, err = rm.hc.Do(req); err == nil {
+			break
+		}
+		if try == tries-1 {
+			return nil, nil, err
+		}
+		rm.failedOver(base) // no answer at all: try the next server
 	}
 	defer resp.Body.Close()
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") { // sprig servers only send JSON or raw bytes
-		return nil, nil, &remoteError{resp.StatusCode, rm.URL + " is not a sprig server; to publish to GitHub use `sprig export-git` and `git push`"}
+		return nil, nil, &remoteError{resp.StatusCode, base + " is not a sprig server; to publish to GitHub use `sprig export-git` and `git push`"}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxObjectSize+1024))
 	if err != nil {
@@ -1071,13 +1171,22 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 	if !ok {
 		return "", 0, fmt.Errorf("remote has no branch %q", branch)
 	}
+	n, err := r.fetchTip(rm, tip)
+	if err != nil {
+		return "", n, err
+	}
+	return tip, n, r.WriteRef("remotes/"+rm.Name+"/"+branch, tip)
+}
+
+// fetchTip downloads everything reachable from tip that is missing here.
+func (r *Repo) fetchTip(rm *Remote, tip string) (int, error) {
 	lazy := r.LoadConfig().Lazy != ""
 	// Download level by level, one batched request per level, into a staging
 	// store; then move objects in, dependencies first, so a partial fetch
 	// never looks complete. Only ids are kept in memory.
 	stageDir, err := os.MkdirTemp(r.Dir, ".fetch-")
 	if err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	defer os.RemoveAll(stageDir)
 	stage := &Repo{Dir: stageDir, Bare: true}
@@ -1120,7 +1229,7 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 			return nil
 		})
 		if err != nil {
-			return "", 0, err
+			return 0, err
 		}
 	}
 	stored := map[string]bool{}
@@ -1140,10 +1249,7 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 		}
 		return os.Rename(stage.objPath(id), r.objPath(id)) // same format, same filesystem
 	}
-	if err := store(tip); err != nil {
-		return "", len(stored), err
-	}
-	return tip, len(stored), r.WriteRef("remotes/"+rm.Name+"/"+branch, tip)
+	return len(stored), store(tip)
 }
 
 func serve(s *Server, addr string) error {
@@ -1153,7 +1259,10 @@ func serve(s *Server, addr string) error {
 	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	what := s.repo.Dir
 	if s.upstream != nil {
-		what = "cache of " + s.upstream.URL
+		what = "cache of " + strings.Join(s.upstream.urls, ", ")
+	}
+	if s.follow != nil {
+		what += " (read-only standby of " + strings.Join(s.follow.urls, ", ") + ")"
 	}
 	fmt.Fprintf(stdout, "serving %s on http://%s\n", what, addr)
 	return srv.ListenAndServe()
