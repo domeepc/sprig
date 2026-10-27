@@ -76,12 +76,11 @@ func scopeOf(req *http.Request) (Scope, bool) {
 	return sc, ok
 }
 
-// readLimited reports whether the request's token may only read some paths.
-// Such tokens get no object-level access: objects are addressed by id alone,
-// so there is no path to check them against.
+// readLimited refuses uploads from read-scoped tokens: they work from a
+// projected history and may only land.
 func readLimited(w http.ResponseWriter, req *http.Request) bool {
 	if sc, ok := scopeOf(req); ok && sc.Read != nil {
-		httpErr(w, 403, "this token may only read files through /v1/file and /v1/ls")
+		httpErr(w, 403, "a read-scoped token can't upload objects; use land")
 		return true
 	}
 	return false
@@ -117,7 +116,7 @@ func (s *Server) Handler() http.Handler {
 		// fetched; everything else (refs, landing, log, ...) goes upstream.
 		s.repo.fallback = s.upstream
 		up := s.upstream
-		mux.Handle("/v1/", &httputil.ReverseProxy{
+		proxy := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				u, _ := url.Parse(up.base())
 				pr.SetURL(u)
@@ -126,12 +125,23 @@ func (s *Server) Handler() http.Handler {
 				up.failedOver(req.URL.Scheme + "://" + req.URL.Host)
 				httpErr(w, 502, "upstream: %v", err)
 			},
-		})
+		}
+		mux.Handle("/v1/", proxy)
+		// Read-scoped tokens see a projection only the main server has.
+		local := func(h http.HandlerFunc) http.HandlerFunc {
+			return func(w http.ResponseWriter, req *http.Request) {
+				if sc, ok := scopeOf(req); ok && sc.Read != nil {
+					proxy.ServeHTTP(w, req)
+					return
+				}
+				h(w, req)
+			}
+		}
 		go s.followUpstream()
-		mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
-		mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
-		mux.HandleFunc("POST /v1/objects/get", s.handleGetObjects)
-		mux.HandleFunc("POST /v1/land", s.handleLand) // merge here; only the ref swap goes upstream
+		mux.HandleFunc("GET /v1/object/{id}", local(s.handleGetObject))
+		mux.HandleFunc("GET /v1/changes/{id}", local(s.handleChange))
+		mux.HandleFunc("POST /v1/objects/get", local(s.handleGetObjects))
+		mux.HandleFunc("POST /v1/land", local(s.handleLand)) // merge here; only the ref swap goes upstream
 		return s.auth(mux)
 	}
 	defer func() {
@@ -199,12 +209,13 @@ func (s *Server) fill(id string) {
 }
 
 func (s *Server) handleGetObject(w http.ResponseWriter, req *http.Request) {
-	if readLimited(w, req) {
-		return
-	}
 	id := req.PathValue("id")
 	if !isID(id) {
 		httpErr(w, 400, "bad id")
+		return
+	}
+	if view := s.viewOf(req); view != nil && !view.may(id) {
+		httpErr(w, 403, "object %s is %v", short(id), errNotInScope)
 		return
 	}
 	s.fill(id)
@@ -399,6 +410,15 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "bad base id")
 		return
 	}
+	view := s.viewOf(req)
+	if view != nil && u.Base != "" { // a projected clone names a projected base
+		if real := view.Real(u.Base); real != "" {
+			u.Base = real
+		} else if !view.may(u.Base) {
+			httpErr(w, 400, "unknown base change %s", short(u.Base))
+			return
+		}
+	}
 	baseTree, err := s.treeOf(u.Base)
 	if err != nil {
 		httpErr(w, 400, "unknown base change %s", short(u.Base))
@@ -578,7 +598,17 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		if raced {
 			continue // someone landed meanwhile: re-merge onto the new tip
 		}
-		writeJSON(w, 200, LandResult{id, tip, retries})
+		res := LandResult{id, tip, retries}
+		if view != nil { // answer in the token's own view of history
+			if res.ID, err = view.Project(s.repo, id); err == nil && tip != "" {
+				res.Parent, err = view.Project(s.repo, tip)
+			}
+			if err != nil {
+				httpErr(w, 500, "%v", err)
+				return
+			}
+		}
+		writeJSON(w, 200, res)
 		s.repo.maybeAutoGC()
 		return
 	}
@@ -736,6 +766,16 @@ func (s *Server) handleLog(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
+	if view := s.viewOf(req); view != nil {
+		if id, err = view.Project(s.repo, id); err != nil {
+			httpErr(w, 500, "%v", err)
+			return
+		}
+		if id == "" {
+			writeJSON(w, 200, []any{})
+			return
+		}
+	}
 	limit := 50
 	if v, err := strconv.Atoi(req.URL.Query().Get("limit")); err == nil && v > 0 && v <= 1000 {
 		limit = v
@@ -758,6 +798,10 @@ func (s *Server) handleLog(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) handleChange(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
+	if view := s.viewOf(req); view != nil && !view.may(id) {
+		httpErr(w, 404, "no change %s", short(id))
+		return
+	}
 	if isID(id) {
 		s.fill(id)
 	}

@@ -53,7 +53,18 @@ func (s *Server) notifyRefs() {
 }
 
 func (s *Server) handleRefs(w http.ResponseWriter, req *http.Request) {
-	refs := s.repo.ListRefs()
+	view := s.viewOf(req)
+	list := func() map[string]string {
+		refs := s.repo.ListRefs()
+		if view != nil {
+			if p, err := view.projectRefs(s.repo, refs); err == nil {
+				return p
+			}
+			return map[string]string{}
+		}
+		return refs
+	}
+	refs := list()
 	etag := refsETag(refs)
 	if wait := req.URL.Query().Get("wait"); wait != "" && wait == etag {
 		deadline := time.NewTimer(longPoll)
@@ -74,7 +85,7 @@ func (s *Server) handleRefs(w http.ResponseWriter, req *http.Request) {
 				writeJSON(w, 200, map[string]any{"refs": refs, "etag": etag})
 				return
 			}
-			refs = s.repo.ListRefs()
+			refs = list()
 			etag = refsETag(refs)
 		}
 	}

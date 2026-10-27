@@ -65,9 +65,6 @@ func readRecords(r io.Reader, fn func(id string, o object) error) error {
 // handleGetObjects returns the requested objects it has, stopping early once
 // the response is large; the client asks again for the rest.
 func (s *Server) handleGetObjects(w http.ResponseWriter, req *http.Request) {
-	if readLimited(w, req) {
-		return
-	}
 	var body struct {
 		IDs []string `json:"ids"`
 	}
@@ -79,9 +76,14 @@ func (s *Server) handleGetObjects(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "too many ids")
 		return
 	}
+	view := s.viewOf(req)
 	for _, id := range body.IDs {
 		if !isID(id) {
 			httpErr(w, 400, "bad id %q", id)
+			return
+		}
+		if view != nil && !view.may(id) {
+			httpErr(w, 403, "object %s is %v", short(id), errNotInScope)
 			return
 		}
 	}
