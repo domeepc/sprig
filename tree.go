@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path"
@@ -328,9 +329,17 @@ func DiffFlat(a, b Flat) []Delta {
 	return out
 }
 
-// withRenames pairs deleted and added files into renames: identical content
-// first, then files sharing at least half their lines (a rename plus an edit).
-func (r *Repo) withRenames(ds []Delta) []Delta {
+// renameThreshold is the default similarity (percent) for a rename + edit.
+const renameThreshold = 50
+
+func (r *Repo) withRenames(ds []Delta) []Delta { return r.withRenamesAt(ds, renameThreshold) }
+
+// withRenamesAt pairs deleted and added files into renames: identical content
+// first, then pairs whose content is at least threshold percent the same
+// (0 turns similarity off). Content is hashed in chunks (lines, cut at 64
+// bytes); an inverted index from chunks to deleted files means each added
+// file is only scored against files it actually shares content with.
+func (r *Repo) withRenamesAt(ds []Delta, threshold int) []Delta {
 	gone := map[string][]int{} // blob id -> indexes of deletions
 	for i, d := range ds {
 		if d.Kind == "D" {
@@ -338,7 +347,6 @@ func (r *Repo) withRenames(ds []Delta) []Delta {
 		}
 	}
 	drop := map[int]bool{}
-	var adds, dels []int
 	for i, d := range ds {
 		if d.Kind != "A" || len(gone[d.New.ID]) == 0 {
 			continue
@@ -348,6 +356,7 @@ func (r *Repo) withRenames(ds []Delta) []Delta {
 		ds[i] = Delta{d.Path, "R", ds[j].Old, d.New, ds[j].Path}
 		drop[j] = true
 	}
+	var adds, dels []int
 	for i, d := range ds {
 		switch {
 		case d.Kind == "A":
@@ -356,50 +365,82 @@ func (r *Repo) withRenames(ds []Delta) []Delta {
 			dels = append(dels, i)
 		}
 	}
-	// shortcut: similarity is only tried for up to 50x50 candidates, to keep big diffs fast.
-	if len(adds) > 0 && len(dels) > 0 && len(adds) <= 50 && len(dels) <= 50 {
-		lines := map[int]map[string]int{}
-		count := func(i int, fe FileEnt) map[string]int {
-			if m, ok := lines[i]; ok {
-				return m
+	// shortcut: above 2,000 x 2,000 candidates only exact renames are found, to keep huge diffs fast.
+	if threshold > 0 && len(adds) > 0 && len(dels) > 0 && len(adds) <= 2000 && len(dels) <= 2000 {
+		type sig struct {
+			chunks map[uint64]int
+			total  int
+		}
+		sigs := map[int]*sig{}
+		sigOf := func(i int, fe FileEnt) *sig {
+			if s, ok := sigs[i]; ok {
+				return s
 			}
 			data, err := r.GetBlob(fe.ID)
 			if err != nil && !r.Bare { // a working-tree file not in the store yet
 				data, err = os.ReadFile(r.abs(ds[i].Path))
 			}
-			var m map[string]int
+			var s *sig
 			if err == nil && len(data) < 1<<20 && !isBinary(data) {
-				m = map[string]int{}
-				for _, l := range splitLines(data) {
-					m[l]++
+				s = &sig{chunks: map[uint64]int{}}
+				for len(data) > 0 {
+					n := bytes.IndexByte(data, '\n') + 1
+					if n == 0 || n > 64 {
+						n = min(len(data), 64)
+					}
+					h := fnv.New64a()
+					h.Write(data[:n])
+					s.chunks[h.Sum64()]++
+					s.total++
+					data = data[n:]
 				}
 			}
-			lines[i] = m
-			return m
+			sigs[i] = s
+			return s
+		}
+		index := map[uint64][]int{} // chunk -> deleted files containing it
+		for _, d := range dels {
+			if s := sigOf(d, ds[d].Old); s != nil {
+				for c := range s.chunks {
+					index[c] = append(index[c], d)
+				}
+			}
 		}
 		type pair struct{ a, d, score int }
 		var pairs []pair
 		for _, a := range adds {
-			am := count(a, ds[a].New)
-			for _, d := range dels {
-				dm := count(d, ds[d].Old)
-				if len(am) == 0 || len(dm) == 0 || ds[a].New.Mode != ds[d].Old.Mode {
-					continue
+			as := sigOf(a, ds[a].New)
+			if as == nil {
+				continue
+			}
+			cands := map[int]bool{}
+			for c := range as.chunks {
+				if l := index[c]; len(l) <= 50 { // chunks everywhere ("}", blank lines) say nothing
+					for _, d := range l {
+						cands[d] = true
+					}
 				}
-				common, total := 0, 0
-				for l, n := range am {
-					common += min(n, dm[l])
-					total += n
+			}
+			for d := range cands {
+				dsig := sigs[d]
+				if ds[a].New.Mode != ds[d].Old.Mode || 200*min(as.total, dsig.total)/(as.total+dsig.total) < threshold {
+					continue // even a perfect overlap could not reach the threshold
 				}
-				for _, n := range dm {
-					total += n
+				common := 0
+				for c, n := range as.chunks {
+					common += min(n, dsig.chunks[c])
 				}
-				if score := 200 * common / total; score >= 50 {
+				if score := 200 * common / (as.total + dsig.total); score >= threshold {
 					pairs = append(pairs, pair{a, d, score})
 				}
 			}
 		}
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
+		sort.Slice(pairs, func(i, j int) bool {
+			if pairs[i].score != pairs[j].score {
+				return pairs[i].score > pairs[j].score
+			}
+			return ds[pairs[i].a].Path < ds[pairs[j].a].Path // deterministic among ties
+		})
 		used := map[int]bool{}
 		for _, p := range pairs {
 			if used[p.a] || used[p.d] {
@@ -416,6 +457,17 @@ func (r *Repo) withRenames(ds []Delta) []Delta {
 		}
 	}
 	return out
+}
+
+// renames maps old path -> new path for files renamed between two trees.
+func (r *Repo) renames(a, b Flat) map[string]string {
+	m := map[string]string{}
+	for _, d := range r.withRenames(DiffFlat(a, b)) {
+		if d.Kind == "R" {
+			m[d.From] = d.Path
+		}
+	}
+	return m
 }
 
 // ---------------------------------------------------------------------------
