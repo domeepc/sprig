@@ -43,6 +43,7 @@ sprig undo                   # back to the conflicted state
 sprig undo                   # and forward again
 
 sprig audit --require review # agent-authored changes without a passing review
+sprig commit -m "docs only" README.md docs/   # commit just these paths
 ```
 
 ### Importing from git
@@ -117,6 +118,24 @@ everything. Any file content sprig needs later (diff, merge, show) is
 downloaded on first use and kept. Files outside the view count as unchanged,
 so `commit`, `land` and `push` work as usual.
 
+Change the view later with `sprig sparse <path>...`, or `sprig sparse .` to
+check out everything.
+
+### Signed changes
+
+```sh
+sprig keygen                       # writes ~/.config/sprig/signing.key (or $SPRIG_KEY)
+sprig trust ed25519:AbC... alice   # keys audit --signed accepts
+sprig audit --signed --require review
+```
+
+With a key, `commit`, `merge` and `land` sign the changes they create, and
+`show`/`log` print who signed each one. A landed change is assembled by the
+server, so the client signs its request (base, edited paths and contents,
+message, metadata). Verification checks that signature and that the server
+changed no other path. A signed path may still hold merged content if someone
+else edited the same file concurrently.
+
 ### Per-directory permissions
 
 ```sh
@@ -149,6 +168,9 @@ git -C ../proj.git push origin main
 git -C ../proj.git fetch origin '+refs/heads/*:refs/heads/*'
 sprig import-git ../proj.git     # fast-forwards your branches
 ```
+
+If both sides moved a branch, `import-git` keeps git's version as
+`git/<branch>`; run `sprig merge git/<branch>` and export again.
 
 Imported history keeps its original git commits, so pushes fast-forward on
 GitHub. New changes become commits with `Sprig-Intent`/`Sprig-Agent`/
@@ -196,6 +218,8 @@ merge.go      history walking, merge base, tree merge, commit/merge/checkout/und
 server.go     HTTP API, landing, scoped tokens, cache tier, push/fetch client
 gitimport.go  git -> sprig converter (via `git cat-file --batch`)
 gitexport.go  sprig -> git converter (via `git fast-import`)
+batch.go      batched object transfer
+sign.go       ed25519 change signatures
 main.go       CLI
 ```
 
@@ -210,21 +234,13 @@ afterwards `status` takes 8 ms and `log` 4 ms.
   zlib-compressed, so storage is about 2x git's on the same history.
 - **Line-based merge only.** The plan was AST-aware merge via tree-sitter;
   this needs a cgo dependency, so it was left out of the prototype.
-- **Criss-cross merges** pick one merge base rather than recursing.
-- **Fetch is one HTTP request per object.** Fine locally, slow over a real
-  network; batching is the obvious next step.
-- **No signatures yet**, so the `agent`/`model` fields are only as trustworthy
-  as whoever wrote the change. Signed changes are what would make `audit`
-  actually mean something.
-- No rename detection, no partial checkout.
-- **Export re-streams every sprig-made change each run.** The output is
-  identical so nothing new lands in git, but it costs time on long histories.
+- **Renames are exact-content only.** A file that was renamed and edited
+  shows as a delete plus an add.
 - **Servers must share a disk.** The ref lock is a Unix file lock, so
   multiple servers need the same local filesystem. Machines on separate
   disks would need a shared lock or database (Scion uses Spanner).
 - **Permissions restrict writes only.** Any valid token can read the whole
   repository.
-- **Partial clones can't widen.** To change `--path`, clone again. A merge
-  conflict in a file outside the view is recorded but not visible on disk.
-- **Diverged branches don't sync.** If GitHub and sprig both moved a branch,
-  `import-git` skips it; there's no fetch-into-a-side-branch to merge from yet.
+- **Hidden conflicts in partial clones.** A merge conflict in a file outside
+  the view is recorded but not visible on disk; widen with `sprig sparse`.
+- **A fetch is held in memory** until it is complete.
