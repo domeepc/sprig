@@ -52,12 +52,15 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/v1/", &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(u) }})
 		mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 		mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
+		mux.HandleFunc("POST /v1/objects/get", s.handleGetObjects)
 		return s.auth(mux)
 	}
 	mux.HandleFunc("GET /v1/refs", s.handleRefs)
 	mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 	mux.HandleFunc("PUT /v1/object/{id}", s.handlePutObject)
 	mux.HandleFunc("POST /v1/objects/missing", s.handleMissing)
+	mux.HandleFunc("POST /v1/objects/get", s.handleGetObjects)
+	mux.HandleFunc("POST /v1/objects/put", s.handlePutObjects)
 	mux.HandleFunc("POST /v1/refs/{name...}", s.handleUpdateRef)
 	mux.HandleFunc("POST /v1/land", s.handleLand)
 	mux.HandleFunc("GET /v1/log", s.handleLog)
@@ -144,16 +147,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "hash mismatch")
 		return
 	}
-	kids, err := Children(typ, data)
-	if err != nil {
-		httpErr(w, 400, "%v", err)
+	if msg := s.checkObject(typ, data); msg != "" {
+		httpErr(w, 409, "%s", msg)
 		return
-	}
-	for _, k := range kids {
-		if !s.repo.HasObject(k) {
-			httpErr(w, 409, "missing dependency %s", short(k))
-			return
-		}
 	}
 	if _, err := s.repo.PutObject(typ, data); err != nil {
 		httpErr(w, 500, "%v", err)
@@ -276,6 +272,7 @@ type LandRequest struct {
 	Message string               `json:"message"`
 	Author  string               `json:"author"`
 	Meta    Meta                 `json:"meta"`
+	Sig     *Signature           `json:"sig,omitempty"` // over landPayload; see sign.go
 }
 
 type LandResult struct {
@@ -346,7 +343,26 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		}
 		ours[p] = FileEnt{f.Mode, id}
 	}
+	var sig *Signature
+	if u.Sig != nil {
+		proof := &LandProof{Branch: u.Branch, Base: u.Base, Files: map[string]string{}}
+		for p, f := range u.Files {
+			proof.Files[p] = ""
+			if f != nil {
+				proof.Files[p] = HashObject(TypeBlob, f.Data)
+			}
+		}
+		if err := checkSig(u.Sig, landPayload(proof, u.Message, u.Author, u.Meta)); err != nil {
+			httpErr(w, 400, "bad signature: %v", err)
+			return
+		}
+		sig = &Signature{Key: u.Sig.Key, Sig: u.Sig.Sig, Land: proof}
+	}
 	if u.Author == "" {
+		if sig != nil {
+			httpErr(w, 400, "a signed landing needs an author")
+			return
+		}
 		u.Author = "unknown <unknown@localhost>"
 	}
 	for retries := 0; retries < maxLandRetries; retries++ {
@@ -405,7 +421,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		}
 		now := time.Now()
 		id, err := s.repo.PutChange(&Change{Parents: parents, Tree: tree, Author: u.Author,
-			Time: now.Unix(), TZ: now.Format("-0700"), Message: u.Message, Meta: u.Meta})
+			Time: now.Unix(), TZ: now.Format("-0700"), Message: u.Message, Meta: u.Meta, Sig: sig})
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -743,19 +759,18 @@ func (r *Repo) Push(rm *Remote, branch string, force bool) (string, error) {
 	for _, id := range missing {
 		need[id] = true
 	}
-	sent := 0
+	var send []string
 	for _, id := range order { // dependency order: the server enforces closure
-		if !need[id] {
-			continue
+		if need[id] {
+			send = append(send, id)
 		}
+	}
+	sent := len(send)
+	if err := rm.PutObjects(send, func(id string) (object, error) {
 		typ, data, err := r.GetObject(id)
-		if err != nil {
-			return "", err
-		}
-		if err := rm.PutObject(id, typ, data); err != nil {
-			return "", err
-		}
-		sent++
+		return object{typ, data}, err
+	}); err != nil {
+		return "", err
 	}
 	if err := rm.UpdateRef("heads/"+branch, old, local, force); err != nil {
 		var re *remoteError
@@ -787,7 +802,9 @@ func (r *Repo) Land(rm *Remote, branch, msg string, meta Meta) (*LandResult, err
 		return nil, err
 	}
 	files := map[string]*LandFile{}
+	proof := &LandProof{Branch: branch, Base: head, Files: map[string]string{}}
 	for _, d := range DiffFlat(base, cur) {
+		proof.Files[d.Path] = d.New.ID // "" for a deletion
 		if d.Kind == "D" {
 			files[d.Path] = nil
 			continue
@@ -801,8 +818,14 @@ func (r *Repo) Land(rm *Remote, branch, msg string, meta Meta) (*LandResult, err
 	if len(files) == 0 {
 		return nil, errNothingToCommit
 	}
-	res, err := rm.Land(&LandRequest{Branch: branch, Base: head, Files: files,
-		Message: msg, Author: r.authorString(), Meta: meta})
+	lr := &LandRequest{Branch: branch, Base: head, Files: files,
+		Message: msg, Author: r.authorString(), Meta: meta}
+	if key, err := signingKey(); err != nil {
+		return nil, err
+	} else if key != nil {
+		lr.Sig = sign(key, landPayload(proof, lr.Message, lr.Author, lr.Meta))
+	}
+	res, err := rm.Land(lr)
 	if err != nil {
 		var re *remoteError
 		if errors.As(err, &re) && strings.Contains(re.Msg, "unknown base") {
@@ -835,47 +858,68 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 		return "", 0, fmt.Errorf("remote has no branch %q", branch)
 	}
 	lazy := r.LoadConfig().Lazy != ""
-	n := 0
-	var fetch func(string) error
-	fetch = func(id string) error {
-		if r.HasObject(id) {
-			return nil
+	// Download level by level, one batched request per level, then store
+	// dependencies first so a partial fetch never looks complete.
+	// shortcut: holds the whole fetch in memory; stream to a staging area for very large fetches.
+	got := map[string]object{}
+	kids := map[string][]string{}
+	for level := []string{tip}; len(level) > 0; {
+		var want []string
+		for _, id := range level {
+			if _, ok := got[id]; !ok && !r.HasObject(id) {
+				got[id] = object{}
+				want = append(want, id)
+			}
 		}
-		typ, data, err := rm.GetObject(id)
-		if err != nil {
-			return err
-		}
-		kids, err := Children(typ, data)
-		if err != nil {
-			return err
-		}
-		if lazy && typ == TypeTree { // file contents are fetched when first read
-			t, err := parseTree(data)
+		level = nil
+		err := rm.GetObjects(want, func(id string, o object) error {
+			if _, asked := got[id]; !asked {
+				return fmt.Errorf("remote sent unrequested object %s", short(id))
+			}
+			ks, err := Children(o.typ, o.data)
 			if err != nil {
 				return err
 			}
-			kids = kids[:0]
-			for _, e := range t.Entries {
-				if e.Mode == "dir" {
-					kids = append(kids, e.ID)
+			if lazy && o.typ == TypeTree { // file contents are fetched when first read
+				t, err := parseTree(o.data)
+				if err != nil {
+					return err
+				}
+				ks = ks[:0]
+				for _, e := range t.Entries {
+					if e.Mode == "dir" {
+						ks = append(ks, e.ID)
+					}
 				}
 			}
+			got[id], kids[id] = o, ks
+			level = append(level, ks...)
+			return nil
+		})
+		if err != nil {
+			return "", 0, err
 		}
-		for _, k := range kids {
-			if err := fetch(k); err != nil {
+	}
+	stored := map[string]bool{}
+	var store func(string) error
+	store = func(id string) error {
+		o, ok := got[id]
+		if !ok || stored[id] {
+			return nil // already present locally
+		}
+		stored[id] = true
+		for _, k := range kids[id] {
+			if err := store(k); err != nil {
 				return err
 			}
 		}
-		if _, err := r.PutObject(typ, data); err != nil {
-			return err
-		}
-		n++
-		return nil
+		_, err := r.PutObject(o.typ, o.data)
+		return err
 	}
-	if err := fetch(tip); err != nil {
-		return "", n, err
+	if err := store(tip); err != nil {
+		return "", len(stored), err
 	}
-	return tip, n, r.WriteRef("remotes/"+rm.Name+"/"+branch, tip)
+	return tip, len(stored), r.WriteRef("remotes/"+rm.Name+"/"+branch, tip)
 }
 
 func serve(s *Server, addr string) error {
