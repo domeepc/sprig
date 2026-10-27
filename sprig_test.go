@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -1525,4 +1526,125 @@ func TestAutoGC(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.Dir, "gc.lock")); err == nil {
 		t.Fatal("gc.lock left behind")
 	}
+}
+
+func TestRenameAwareMerge(t *testing.T) {
+	newRepo(t)
+	body := ""
+	for i := range 30 {
+		body += fmt.Sprintf("line %d\n", i)
+	}
+	write(t, "lib/util.txt", body)
+	write(t, "lib/other.txt", "other\n")
+	must(t, "commit", "-m", "base")
+	must(t, "checkout", "-b", "edit")
+	write(t, "lib/util.txt", strings.Replace(body, "line 5\n", "line FIVE\n", 1))
+	write(t, "lib/new.txt", "added on the edit branch\n")
+	must(t, "commit", "-m", "edit util, add to lib")
+	must(t, "checkout", "main")
+	os.MkdirAll("pkg", 0o755)
+	os.Rename("lib/util.txt", "pkg/util.txt")
+	os.Rename("lib/other.txt", "pkg/other.txt")
+	write(t, "pkg/util.txt", strings.Replace(body, "line 25\n", "line 25!\n", 1))
+	must(t, "commit", "-m", "move lib to pkg, tweak")
+	if out, err := sp(t, "merge", "edit"); err != nil {
+		t.Fatalf("rename vs edit conflicted: %v %s", err, out)
+	}
+	got := read(t, "pkg/util.txt")
+	if !strings.Contains(got, "line FIVE") || !strings.Contains(got, "line 25!") {
+		t.Fatalf("edit not carried into the renamed file:\n%s", got)
+	}
+	if _, err := os.Stat("lib/util.txt"); err == nil {
+		t.Fatal("old path came back")
+	}
+	if read(t, "pkg/new.txt") != "added on the edit branch\n" {
+		t.Fatal("file added to the moved directory did not follow it")
+	}
+	if out := must(t, "status", "-M", "0"); !strings.Contains(out, "clean") {
+		t.Fatalf("status: %s", out)
+	}
+}
+
+func TestLandFollowsRename(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, repo := seedServer(t, NewServer(srv, ""))
+	body := ""
+	for i := range 30 {
+		body += fmt.Sprintf("row %d\n", i)
+	}
+	write(t, "a.txt", body)
+	must(t, "commit", "-m", "long a")
+	must(t, "push")
+	refs, _ := newRemote("t", url).Refs()
+	stale := refs["heads/main"]
+	// someone renames a.txt
+	os.Rename("a.txt", "b.txt")
+	must(t, "commit", "-m", "rename")
+	must(t, "push")
+	// a signed landing edits a.txt against the old base
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	edited := strings.Replace(body, "row 3\n", "row three\n", 1)
+	proof := &LandProof{Branch: "main", Base: stale, Files: map[string]string{"a.txt": HashObject(TypeBlob, []byte(edited))}}
+	lr := &LandRequest{Branch: "main", Base: stale, Message: "edit a", Author: "x <x@y>",
+		Files: map[string]*LandFile{"a.txt": {Mode: "file", Data: []byte(edited)}}}
+	lr.Sig = sign(priv, landPayload(proof, lr.Message, lr.Author, lr.Meta))
+	res, err := newRemote("t", url).Land(lr)
+	if err != nil {
+		t.Fatalf("landing on a renamed file: %v", err)
+	}
+	flat, _ := repo.ChangeFlat(res.ID)
+	if _, ok := flat["a.txt"]; ok {
+		t.Fatal("landing resurrected the old path")
+	}
+	if b, _ := repo.GetBlob(flat["b.txt"].ID); !strings.Contains(string(b), "row three") {
+		t.Fatal("edit did not land in the renamed file")
+	}
+	c, _ := repo.GetChange(res.ID)
+	if _, err := repo.VerifyChange(c); err != nil || c.Sig.Moved["a.txt"] != "b.txt" {
+		t.Fatalf("signature with a followed rename: %v (moved %v)", err, c.Sig.Moved)
+	}
+	forged := *c
+	sig := *c.Sig
+	sig.Moved = map[string]string{"a.txt": "x.txt"}
+	forged.Sig = &sig
+	if _, err := repo.VerifyChange(&forged); err == nil {
+		t.Fatal("made-up move claim verified")
+	}
+}
+
+func TestRenameDetectionScales(t *testing.T) {
+	newRepo(t)
+	for i := range 1000 {
+		write(t, fmt.Sprintf("old/f%d.txt", i), fmt.Sprintf("file %d\nshared header\n%s\n", i, strings.Repeat(fmt.Sprint(i, " "), 20)))
+	}
+	must(t, "commit", "-m", "many")
+	r, _ := FindRepo()
+	_, head := r.Head()
+	a, _ := r.ChangeFlat(head)
+	b := Flat{}
+	for p, fe := range a {
+		b["new/"+strings.TrimPrefix(p, "old/")] = fe
+	}
+	for i := 0; i < 1000; i += 2 { // half of them edited as well
+		p := fmt.Sprintf("new/f%d.txt", i)
+		data, _ := r.GetBlob(b[p].ID)
+		id, _ := r.PutBlob(append(data, "edited\n"...))
+		b[p] = FileEnt{"file", id}
+	}
+	start := time.Now()
+	ds := r.withRenames(DiffFlat(a, b))
+	took := time.Since(start)
+	renamed := 0
+	for _, d := range ds {
+		if d.Kind == "R" && strings.TrimPrefix(d.From, "old/") == strings.TrimPrefix(d.Path, "new/") {
+			renamed++
+		}
+	}
+	if renamed != 1000 {
+		t.Fatalf("found %d of 1000 renames", renamed)
+	}
+	if took > 300*time.Millisecond { // generous for -race; ~50 ms normally
+		t.Fatalf("rename detection took %v", took)
+	}
+	t.Logf("1000 renames (500 edited) in %v", took)
 }
