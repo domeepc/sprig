@@ -326,38 +326,55 @@ reflog.go     server ref log
 lock_*.go     ref lock per platform
 project.go    projected history for read-scoped tokens
 main.go       CLI
+bench/        git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
 
 ## Measured
 
-Same history in both (300 Go files, 300 commits of small edits; sprig's
-packed with `gc`), average wall time per command, Linux, warm disk cache:
+`bench/run.sh` builds the same history in git and sprig (100 files per
+directory, 100 commits of 3-file edits, imported into sprig and packed with
+`gc`), runs each command 20 times with a clean `HOME`, and writes
+`bench/results.csv`; `bench/chart.py` (Python standard library only) draws
+the charts. Linux, 12 cores, warm disk cache, average wall time.
 
-| Command | git | sprig |
-|---|---|---|
-| `commit` (one file) | 29.6 ms | **7.9 ms** |
-| `checkout` (switch 50 commits back) | 9.3 ms | **8.6 ms** |
-| `diff HEAD~50 HEAD` | 6.6 ms | 7.2 ms |
-| `show HEAD~10` | 2.5 ms | 3.9 ms |
-| `log -n 100` | 2.8 ms | 4.5 ms |
-| `status` (clean) | 2.5 ms | 3.4 ms |
-| `diff` (working tree, one file changed) | 2.1 ms | 3.8 ms |
-| starting the program (`version`) | 1.2 ms | 2.3 ms |
+![git vs sprig at 3,000 files](bench/at-3000.svg)
 
-With 3,000 files, `status` takes 5.8 ms (git 3.9 ms), and 2.9 ms with
-`sprig watch` running (faster than git, which still stats every file).
+![each command against repo size, 1k to 30k files](bench/scaling.svg)
 
-Most of what remains is startup: a Go program needs ~0.3 ms more than C to
-start, linking tree-sitter (cgo, dynamic libc) another ~0.3 ms, and package
-initialisation ~0.6 ms. Past that, sprig does about the same work as git or
-less: objects are cached per process, packs are memory-mapped and keep the
-newest version of each file whole, diffs between commits skip identical
-directories, and `status` only compares against HEAD what the stat cache
-or the watcher can't vouch for. `SPRIG_CPUPROFILE=file` writes a CPU profile
-of any command.
+| Command | 1k files git / sprig | 3k | 10k | 30k |
+|---|---|---|---|---|
+| starting the program (`version`) | 1.2 / 2.5 | 1.2 / 2.4 | 1.2 / 2.3 | 1.2 / 2.4 |
+| `status` (clean) | 3.4 / 4.2 | 3.9 / 5.9 | 7.4 / 12.0 | 18.1 / 34.8 |
+| `status`, `sprig watch` running | 3.3 / **3.0** | 4.0 / **3.0** | 7.7 / **3.0** | 19.5 / **3.6** |
+| `status` (1 modified) | 3.3 / 4.8 | 4.0 / 7.4 | 7.9 / 17.1 | 18.0 / 43.7 |
+| `diff` (working tree) | 2.6 / 5.2 | 2.7 / 8.1 | 4.3 / 20.0 | 9.7 / 52.8 |
+| `log -n 100` | 3.6 / 4.0 | 3.6 / 4.0 | 3.4 / 4.1 | 2.9 / 4.5 |
+| `show HEAD~10` | 2.4 / 4.0 | 2.3 / 4.2 | 2.3 / 4.8 | 2.4 / 6.6 |
+| `diff HEAD~50 HEAD` | 10.4 / **7.8** | 10.5 / **7.6** | 7.3 / 8.1 | 6.9 / 9.4 |
+| `checkout` (50 commits back) | 11.3 / 11.8 | 12.2 / 19.3 | 15.8 / 47.4 | 27.8 / 135 |
+| `commit` (one file) | 6.3 / 7.7 | 9.3 / 11.0 | 11.3 / 25.2 | 21.6 / 75.0 |
+| storage after gc (KB) | 424 / **404** | 800 / 928 | 2,120 / 2,764 | 5,936 / 8,132 |
 
-Storage for the same history: git after `git gc` 847 KB, sprig after
-`sprig gc` 837 KB (2.8 MB as loose objects before).
+(ms unless noted; bold where sprig wins.)
+
+What this shows:
+
+- **Startup costs ~1.2 ms more than git** at every size: Go's runtime
+  (~0.3 ms), linking tree-sitter through cgo with a dynamic libc (~0.3 ms) and
+  package initialisation (~0.6 ms). On small repos that is most of the gap.
+- **With `sprig watch`, `status` stays at ~3 ms at any size**, because it
+  only checks the files the watcher saw change, while git stats every file
+  (5x faster than git at 30k files).
+- **Without the watcher, sprig falls behind as repos grow.** `status`,
+  working-tree `diff`, `checkout` and `commit` all walk or rewrite more of the
+  tree than git does; at 30k files they are 2-5x slower. git's index keeps
+  the whole tree flat and sorted in one mmap'd file; sprig loads a stat
+  cache and rebuilds tree objects per directory.
+- **History commands are close to git** and grow slowly with size; diffs
+  between commits skip identical directories and win at small sizes.
+- **Storage is about git's at 1k files and ~1.4x at 30k.**
+
+`SPRIG_CPUPROFILE=file` writes a CPU profile of any command.
 
 ## Not done (yet)
 
@@ -375,6 +392,9 @@ Storage for the same history: git after `git gc` 847 KB, sprig after
 - **Small commands start ~1 ms behind git.** That is Go's runtime, cgo and
   package initialisation; a statically linked build (needs a static libc,
   e.g. `glibc-static`) would trim part of it.
+- **Large working trees are slower than git without `sprig watch`.** At 30k
+  files `status` is 2x, `commit` 3.5x and `checkout` 5x git's time (see
+  Measured); run `sprig watch` for status, the rest needs an index like git's.
 - **Loose objects use a file each** until gc runs. Auto gc starts at about
   6,400 of them (estimated, as git does), so a busy server holds up to that
   many loose files between runs.
