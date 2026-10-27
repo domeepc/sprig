@@ -181,7 +181,16 @@ func (r *Repo) Watch(stop <-chan struct{}, ready func()) error {
 // ok=false when no watcher can vouch for that. running reports that a watcher
 // answered, so the caller should save a fresh cache it can vouch for next time.
 func (r *Repo) askWatcher(cache statCache) (dirty []string, ok, running bool) {
-	if r.Bare || os.Getenv("SPRIG_NO_WATCH") != "" {
+	dirty, ok, running = r.askWatcherSince(cache.Written)
+	if len(cache.Files) == 0 {
+		ok = false // no cache to apply the answer to
+	}
+	return dirty, ok, running
+}
+
+// askWatcherSince returns the paths changed since a time (unix ns).
+func (r *Repo) askWatcherSince(since int64) (dirty []string, ok, running bool) {
+	if r.Bare || since == 0 || os.Getenv("SPRIG_NO_WATCH") != "" {
 		return nil, false, false
 	}
 	sock, err := r.watchSock()
@@ -194,13 +203,13 @@ func (r *Repo) askWatcher(cache statCache) (dirty []string, ok, running bool) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-	fmt.Fprintf(conn, "since %d\n", cache.Written)
+	fmt.Fprintf(conn, "since %d\n", since)
 	br := bufio.NewReader(conn)
 	l, err := br.ReadString('\n')
 	if err != nil {
 		return nil, false, false
 	}
-	if l != "ok\n" || cache.Written == 0 || len(cache.Files) == 0 {
+	if l != "ok\n" {
 		return nil, false, true
 	}
 	for {

@@ -11,3 +11,7 @@ func (r *Repo) Watch(stop <-chan struct{}, ready func()) error {
 func (r *Repo) askWatcher(cache statCache) (dirty []string, ok, running bool) {
 	return nil, false, false
 }
+
+func (r *Repo) askWatcherSince(since int64) (dirty []string, ok, running bool) {
+	return nil, false, false
+}
