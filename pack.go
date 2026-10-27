@@ -47,39 +47,67 @@ const (
 	autoGCLoose   = 6400 // estimated loose objects that trigger a background gc
 )
 
+// Made on first use: commands that never touch a pack don't pay for them.
 var (
-	zstdEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-	zstdDec, _ = zstd.NewReader(nil)
+	zstdEnc = sync.OnceValue(func() *zstd.Encoder {
+		e, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+		return e
+	})
+	zstdDec = sync.OnceValue(func() *zstd.Decoder {
+		d, _ := zstd.NewReader(nil)
+		return d
+	})
 )
 
 type pack struct {
 	path string
 	idx  []byte
 	v2   bool
+
+	once sync.Once
+	f    *os.File // opened on first read and kept: ReadAt is safe to share
+	ferr error
+	data []byte // the pack mapped into memory, where the platform allows
+}
+
+// file returns the pack's open file. shortcut: handles of packs a gc replaced stay open until exit; fine for CLI runs, servers leak a few.
+func (p *pack) file() (*os.File, error) {
+	p.once.Do(func() {
+		if p.f, p.ferr = os.Open(p.path); p.ferr == nil {
+			p.data, _ = mmapFile(p.f) // nil: fall back to ReadAt
+		}
+	})
+	return p.f, p.ferr
 }
 
 type packSet struct {
 	mu     sync.Mutex
 	packs  []*pack
 	loaded time.Time // packs dir mtime when last loaded
+	once   bool      // loaded at least once
 }
 
 var packCache sync.Map // repo dir -> *packSet
 
 func (r *Repo) packDir() string { return filepath.Join(r.Dir, "packs") }
 
-// packList returns the repo's packs, re-reading the directory if it changed
-// (another process may have run gc) or if reload is set.
+// packList returns the repo's packs. They are read once; with reload set,
+// the directory is checked again (another process may have run gc), which
+// callers do when an object they expect is missing.
 func (r *Repo) packList(reload ...bool) []*pack {
 	v, _ := packCache.LoadOrStore(r.Dir, &packSet{})
 	ps := v.(*packSet)
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if ps.once && len(reload) == 0 {
+		return ps.packs
+	}
+	ps.once = true
 	st, err := os.Stat(r.packDir())
 	if err != nil {
 		return nil
 	}
-	if st.ModTime().Equal(ps.loaded) && len(reload) == 0 {
+	if st.ModTime().Equal(ps.loaded) && ps.packs != nil {
 		return ps.packs
 	}
 	ents, _ := os.ReadDir(r.packDir())
@@ -108,7 +136,7 @@ func loadPack(name string) (*pack, bool) {
 	defer f.Close()
 	magic := make([]byte, len(packMagic))
 	n, _ := io.ReadFull(f, magic)
-	return &pack{name + ".pack", idx, n == len(packMagic) && string(magic) == packMagic}, true
+	return &pack{path: name + ".pack", idx: idx, v2: n == len(packMagic) && string(magic) == packMagic}, true
 }
 
 func (p *pack) find(raw []byte) (int64, bool) {
@@ -133,6 +161,15 @@ func (r *Repo) inPack(id string) (*pack, int64, bool) {
 	return nil, 0, false
 }
 
+// inPackFresh is inPack, looking at the packs directory again on a miss.
+func (r *Repo) inPackFresh(id string) (*pack, int64, bool) {
+	if p, off, ok := r.inPack(id); ok {
+		return p, off, ok
+	}
+	r.packList(true)
+	return r.inPack(id)
+}
+
 // packedPrefix lists packed ids starting with a hex prefix.
 func (r *Repo) packedPrefix(prefix string) []string {
 	var out []string
@@ -147,7 +184,7 @@ func (r *Repo) packedPrefix(prefix string) []string {
 }
 
 func (r *Repo) readPacked(id string, depth int) (string, []byte, error) {
-	p, off, ok := r.inPack(id)
+	p, off, ok := r.inPackFresh(id)
 	if !ok {
 		return "", nil, fmt.Errorf("object %s %w", short(id), errObjectNotFound)
 	}
@@ -162,37 +199,68 @@ func (r *Repo) readPacked(id string, depth int) (string, []byte, error) {
 }
 
 func (r *Repo) readEntry(p *pack, off int64, id string, depth int) (string, []byte, error) {
+	typ, data, _, err := r.readEntryBody(p, off, id, depth)
+	return typ, data, err
+}
+
+// readEntryBody also returns the form deltas against this entry apply to,
+// and caches both, so a chain of deltas is decoded once.
+func (r *Repo) readEntryBody(p *pack, off int64, id string, depth int) (string, []byte, []byte, error) {
+	key := p.path + "@" + strconv.FormatInt(off, 10)
+	if c, ok := objects.get(key); ok {
+		return c.typ, c.data, c.body, nil
+	}
+	typ, data, body, err := r.decodeEntry(p, off, id, depth)
+	if err == nil {
+		objects.put(&cacheEntry{key: key, typ: typ, data: data, body: body})
+	}
+	return typ, data, body, err
+}
+
+func (r *Repo) decodeEntry(p *pack, off int64, id string, depth int) (string, []byte, []byte, error) {
 	if depth > maxDeltaDepth+1 {
-		return "", nil, fmt.Errorf("object %s corrupt: delta chain too long", short(id))
+		return "", nil, nil, fmt.Errorf("object %s corrupt: delta chain too long", short(id))
 	}
-	f, err := os.Open(p.path)
+	f, err := p.file()
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	defer f.Close()
 	corrupt := func(err error) error { return fmt.Errorf("object %s corrupt: %v", short(id), err) }
 	var typ, enc string
 	var data []byte
 	var baseData func() ([]byte, error)
+	baseIsBody := false
 	if p.v2 {
-		br := bufio.NewReader(io.NewSectionReader(f, off, 1<<62))
-		n, err := binary.ReadUvarint(br)
-		if err != nil || n < 1 || n > maxObjectSize*2 {
-			return "", nil, corrupt(errors.New("bad entry length"))
-		}
-		body := make([]byte, n)
-		if _, err := io.ReadFull(br, body); err != nil {
-			return "", nil, corrupt(err)
+		var body []byte
+		if p.data != nil { // mapped: the entry is a slice of memory, no read calls
+			if off < 0 || off >= int64(len(p.data)) {
+				return "", nil, nil, corrupt(errors.New("bad offset"))
+			}
+			n, k := binary.Uvarint(p.data[off:])
+			if k <= 0 || n < 1 || n > uint64(len(p.data))-uint64(off)-uint64(k) {
+				return "", nil, nil, corrupt(errors.New("bad entry length"))
+			}
+			body = p.data[off+int64(k) : off+int64(k)+int64(n)]
+		} else {
+			br := bufio.NewReader(io.NewSectionReader(f, off, 1<<62))
+			n, err := binary.ReadUvarint(br)
+			if err != nil || n < 1 || n > maxObjectSize*2 {
+				return "", nil, nil, corrupt(errors.New("bad entry length"))
+			}
+			body = make([]byte, n)
+			if _, err := io.ReadFull(br, body); err != nil {
+				return "", nil, nil, corrupt(err)
+			}
 		}
 		if body[0] == 1 {
-			if body, err = zstdDec.DecodeAll(body[1:], nil); err != nil {
-				return "", nil, corrupt(err)
+			if body, err = zstdDec().DecodeAll(body[1:], nil); err != nil {
+				return "", nil, nil, corrupt(err)
 			}
 		} else {
-			body = body[1:]
+			body = append([]byte(nil), body[1:]...) // never hand out the read-only mapping itself
 		}
 		if len(body) < 3 || int(body[0]) >= len(packTypes) || body[1] > 1 {
-			return "", nil, corrupt(errors.New("bad entry header"))
+			return "", nil, nil, corrupt(errors.New("bad entry header"))
 		}
 		typ, enc = packTypes[body[0]], [...]string{"raw", "ctree"}[body[1]]
 		kind, rest := body[2], body[3:]
@@ -202,16 +270,17 @@ func (r *Repo) readEntry(p *pack, off int64, id string, depth int) (string, []by
 		case 1:
 			bo, k := binary.Uvarint(rest)
 			if k <= 0 {
-				return "", nil, corrupt(errors.New("bad base offset"))
+				return "", nil, nil, corrupt(errors.New("bad base offset"))
 			}
 			data = rest[k:]
 			baseData = func() ([]byte, error) {
-				_, b, err := r.readEntry(p, int64(bo), "", depth+1)
-				return b, err
+				_, _, b, err := r.readEntryBody(p, int64(bo), "", depth+1)
+				return b, err // already in the form the delta applies to
 			}
+			baseIsBody = true
 		case 2:
 			if len(rest) < 32 {
-				return "", nil, corrupt(errors.New("bad base id"))
+				return "", nil, nil, corrupt(errors.New("bad base id"))
 			}
 			base := hex.EncodeToString(rest[:32])
 			data = rest[32:]
@@ -220,24 +289,24 @@ func (r *Repo) readEntry(p *pack, off int64, id string, depth int) (string, []by
 				return b, err
 			}
 		default:
-			return "", nil, corrupt(errors.New("bad base kind"))
+			return "", nil, nil, corrupt(errors.New("bad base kind"))
 		}
 	} else {
 		zr, err := zlib.NewReader(io.NewSectionReader(f, off, 1<<62))
 		if err != nil {
-			return "", nil, corrupt(err)
+			return "", nil, nil, corrupt(err)
 		}
 		raw, err := io.ReadAll(io.LimitReader(zr, maxObjectSize*2))
 		if err != nil {
-			return "", nil, corrupt(err)
+			return "", nil, nil, corrupt(err)
 		}
 		i := bytes.IndexByte(raw, 0)
 		f3 := strings.Fields(string(raw[:max(i, 0)]))
 		if i < 0 || len(f3) != 3 {
-			return "", nil, corrupt(errors.New("bad header"))
+			return "", nil, nil, corrupt(errors.New("bad header"))
 		}
 		if n, err := strconv.Atoi(f3[2]); err != nil || n != len(raw)-i-1 {
-			return "", nil, corrupt(errors.New("bad length"))
+			return "", nil, nil, corrupt(errors.New("bad length"))
 		}
 		typ, enc, data = f3[0], "raw", raw[i+1:]
 		if base := f3[1]; base != "-" {
@@ -250,30 +319,31 @@ func (r *Repo) readEntry(p *pack, off int64, id string, depth int) (string, []by
 	if baseData != nil {
 		bdata, err := baseData()
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
-		if enc == "ctree" {
+		if enc == "ctree" && !baseIsBody {
 			var ok bool
 			if bdata, ok = compactTree(bdata); !ok {
-				return "", nil, corrupt(errors.New("delta base is not a compactable tree"))
+				return "", nil, nil, corrupt(errors.New("delta base is not a compactable tree"))
 			}
 		}
 		if data, err = applyDelta(bdata, data); err != nil {
-			return "", nil, corrupt(err)
+			return "", nil, nil, corrupt(err)
 		}
 	}
+	body := data
 	if enc == "ctree" {
 		if data, err = expandTree(data); err != nil {
-			return "", nil, corrupt(err)
+			return "", nil, nil, corrupt(err)
 		}
 	}
 	if id == "" { // a base read by offset: the final object's hash check covers it
-		return typ, data, nil
+		return typ, data, body, nil
 	}
 	if HashObject(typ, data) != id {
-		return "", nil, corrupt(errors.New("hash mismatch"))
+		return "", nil, nil, corrupt(errors.New("hash mismatch"))
 	}
-	return typ, data, nil
+	return typ, data, body, nil
 }
 
 var packTypes = []string{TypeBlob, TypeTree, TypeChange}
@@ -500,13 +570,15 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 }
 
 // pairVersions records, for every file and directory that differs between
-// two trees, the old version as the delta base of the new one.
+// two trees, the new version as the delta base of the old one. So the newest
+// version of everything is stored whole and reads of current files decode no
+// chain; history further back costs more, as in git.
 func (r *Repo) pairVersions(old, new string, prev map[string]string) {
 	if old == new {
 		return
 	}
-	if prev[new] == "" {
-		prev[new] = old
+	if prev[old] == "" {
+		prev[old] = new
 	}
 	ot, err1 := r.GetTree(old)
 	nt, err2 := r.GetTree(new)
@@ -523,8 +595,8 @@ func (r *Repo) pairVersions(old, new string, prev map[string]string) {
 		case !ok || o.ID == e.ID:
 		case e.Mode == "dir" && o.Mode == "dir":
 			r.pairVersions(o.ID, e.ID, prev)
-		case e.Mode != "dir" && o.Mode != "dir" && prev[e.ID] == "":
-			prev[e.ID] = o.ID
+		case e.Mode != "dir" && o.Mode != "dir" && prev[o.ID] == "":
+			prev[o.ID] = e.ID
 		}
 	}
 }
@@ -716,7 +788,7 @@ func (r *Repo) GC(repack bool) (*GCResult, error) {
 		}
 		plain := append(head, payload...)
 		entry := append([]byte{0}, plain...)
-		if z := zstdEnc.EncodeAll(plain, nil); len(z) < len(plain) {
+		if z := zstdEnc().EncodeAll(plain, nil); len(z) < len(plain) {
 			entry = append([]byte{1}, z...)
 		}
 		raw, _ := hex.DecodeString(id)

@@ -211,10 +211,13 @@ func (r *Repo) HasObject(id string) bool {
 	if !isID(id) {
 		return false
 	}
+	if _, _, ok := r.inPack(id); ok {
+		return true
+	}
 	if _, err := os.Stat(r.objPath(id)); err == nil {
 		return true
 	}
-	_, _, ok := r.inPack(id)
+	_, _, ok := r.inPackFresh(id)
 	return ok
 }
 
@@ -272,9 +275,19 @@ func (r *Repo) getLocal(id string) (string, []byte, error) { return r.readLocalA
 
 // readLocalAt reads a loose or packed object; depth counts delta hops.
 func (r *Repo) readLocalAt(id string, depth int) (string, []byte, error) {
-	typ, data, err := r.readLoose(id)
-	if errors.Is(err, errObjectNotFound) {
-		return r.readPacked(id, depth)
+	if c, ok := objects.get(id); ok {
+		return c.typ, c.data, nil
+	}
+	var typ string
+	var data []byte
+	var err error
+	if p, off, ok := r.inPack(id); ok { // known packed: skip looking for a loose file
+		typ, data, err = r.readEntry(p, off, id, depth)
+	} else if typ, data, err = r.readLoose(id); errors.Is(err, errObjectNotFound) {
+		typ, data, err = r.readPacked(id, depth) // maybe a gc just packed it
+	}
+	if err == nil {
+		objects.put(&cacheEntry{key: id, typ: typ, data: data})
 	}
 	return typ, data, err
 }
