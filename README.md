@@ -27,6 +27,7 @@ go test ./...
 | **Server-side policy** | The server refuses ref updates that are non-fast-forward, point at an unknown change, or whose tip has unresolved conflicts. Objects are hash-verified and only accepted once everything they reference is present, so a ref can never point at partial history. |
 | **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths, and `--hunk path:N` only some hunks of a file. |
 | **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read, including ones rebuilt from deltas in a pack. |
+| **Merges follow renames** | Renames are detected by content (`-M` sets the similarity, default 50%). When one side renames a file and the other edits it, the edit lands in the renamed file; files added to a directory the other side moved follow it. `land` does the same against renames that landed after your base. |
 | **Merges understand Go** | When a line merge of a `.go` file conflicts, sprig retries per import and per top-level declaration, so two sides adding imports or functions merge cleanly. |
 
 ## Quick tour
@@ -320,5 +321,6 @@ Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
 - **Loose objects use a file each** until gc runs. Auto gc starts at about
   6,400 of them (estimated, as git does), so a busy server holds up to that
   many loose files between runs.
-- **Renames use a simple line-overlap score** and only among up to 50
-  added x 50 deleted files.
+- **Rename detection has limits.** Beyond 2,000 added x 2,000 deleted files
+  only exact renames are found; a file renamed differently on both sides of a
+  merge is left as two files rather than reported as a conflict.
