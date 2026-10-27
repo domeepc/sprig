@@ -301,6 +301,7 @@ overflow, `.sprigignore` changed), sprig falls back to the full walk. Set
 | `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
 | `SPRIG_NO_WATCH` | ignore a running `sprig watch` and walk the whole tree |
 | `SPRIG_NO_AUTOGC` | never start a background `gc --auto` |
+| `SPRIG_CPUPROFILE` | write a CPU profile of the command to this file |
 
 ## Layout
 
@@ -315,6 +316,8 @@ gitexport.go  sprig -> git converter (via `git fast-import`)
 batch.go      batched object transfer
 sign.go       ed25519 change signatures
 pack.go       packfiles (zstd, compact trees, deltas), gc, auto gc
+cache.go      per-process cache of decoded objects and trees
+statusfast.go status that only compares what may have changed
 astmerge.go   Go-aware merge (go/parser), shared unit merge
 langs.go      tree-sitter merge for Python, JS/TS, Rust, Java
 watch.go      `sprig watch` file watcher (fsnotify)
@@ -327,16 +330,34 @@ main.go       CLI
 
 ## Measured
 
-A synthetic git repo with 3,001 commits and 300 files imports in about 8s;
-afterwards `status` takes 8 ms and `log` 4 ms. With 3,000 files, `status`
-takes about 7.4 ms (49 ms before the stat cache, 17 ms before the parallel
-walk), or 5.3 ms with `sprig watch` running; git takes about 1.5 ms. Starting
-the sprig process alone takes about 2.3 ms of that.
+Same history in both (300 Go files, 300 commits of small edits; sprig's
+packed with `gc`), average wall time per command, Linux, warm disk cache:
 
-Storage, 300 Go files with 300 commits of small edits: git after `git gc`
-847 KB; sprig 2.8 MB of loose objects (10.7 MB on disk, one file each),
-807 KB after `sprig gc` (2,005 of 2,673 objects stored as deltas, in 1.4 s).
-Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
+| Command | git | sprig |
+|---|---|---|
+| `commit` (one file) | 29.6 ms | **7.9 ms** |
+| `checkout` (switch 50 commits back) | 9.3 ms | **8.6 ms** |
+| `diff HEAD~50 HEAD` | 6.6 ms | 7.2 ms |
+| `show HEAD~10` | 2.5 ms | 3.9 ms |
+| `log -n 100` | 2.8 ms | 4.5 ms |
+| `status` (clean) | 2.5 ms | 3.4 ms |
+| `diff` (working tree, one file changed) | 2.1 ms | 3.8 ms |
+| starting the program (`version`) | 1.2 ms | 2.3 ms |
+
+With 3,000 files, `status` takes 5.8 ms (git 3.9 ms), and 2.9 ms with
+`sprig watch` running (faster than git, which still stats every file).
+
+Most of what remains is startup: a Go program needs ~0.3 ms more than C to
+start, linking tree-sitter (cgo, dynamic libc) another ~0.3 ms, and package
+initialisation ~0.6 ms. Past that, sprig does about the same work as git or
+less: objects are cached per process, packs are memory-mapped and keep the
+newest version of each file whole, diffs between commits skip identical
+directories, and `status` only compares against HEAD what the stat cache
+or the watcher can't vouch for. `SPRIG_CPUPROFILE=file` writes a CPU profile
+of any command.
+
+Storage for the same history: git after `git gc` 847 KB, sprig after
+`sprig gc` 837 KB (2.8 MB as loose objects before).
 
 ## Not done (yet)
 
@@ -351,10 +372,9 @@ Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
   read-scoped token walks the whole history; later ones only project new
   changes. Caches pass such tokens' requests to the main server, and a read
   scope can't be widened for an existing clone (clone again).
-- **`status` is ~5–7 ms at 3,000 files, git ~1.5 ms.** What's left is process
-  startup (~2.3 ms) and building in-memory maps of every file; a
-  memory-mapped index that status could compare without maps would close
-  more of it.
+- **Small commands start ~1 ms behind git.** That is Go's runtime, cgo and
+  package initialisation; a statically linked build (needs a static libc,
+  e.g. `glibc-static`) would trim part of it.
 - **Loose objects use a file each** until gc runs. Auto gc starts at about
   6,400 of them (estimated, as git does), so a busy server holds up to that
   many loose files between runs.
