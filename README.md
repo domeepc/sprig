@@ -192,9 +192,17 @@ To limit reading too, give the token an object:
 { "contractor-token-0123456789": { "write": ["services/api"], "read": ["services/api", "docs"] } }
 ```
 
-Such a token can only read through `/v1/file` and `/v1/ls` (which hides
-everything outside its paths) and land. It gets no raw object access, since
-an object id says nothing about which path it belongs to.
+Such a token sees a projection of the repository: every change rebuilt with
+only its paths, and changes that touched nothing there left out. Projected
+changes are real objects, so the token can `sprig clone`, `fetch`, `log`
+and `land` normally; its refs, `/log`, `/changes` and object requests are
+answered from the projection, so no file, tree or commit message outside
+its paths reaches it. `/file` and `/ls` hide everything else too. A landing
+names a projected base; the server maps it back to the real change, merges,
+and answers with the projected result. The mapping is stored under
+`projections/` and extended as history grows. Projected changes carry
+`projected_from` (the real id) and no signature; verify signatures on the
+server.
 
 ### Pushing to GitHub (or any git host)
 
@@ -313,6 +321,7 @@ watch.go      `sprig watch` file watcher (fsnotify)
 follow.go     ref long-poll, caches following upstream, read-only standbys
 reflog.go     server ref log
 lock_*.go     ref lock per platform
+project.go    projected history for read-scoped tokens
 main.go       CLI
 ```
 
@@ -338,9 +347,10 @@ Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
 - **One authority holds the refs.** Caches on any machine do the landing
   work and standbys mirror everything, but every ref swap goes to a single
   main server (Scion keeps refs in Spanner). Failover to a standby is manual.
-- **Read-scoped tokens can't clone.** Objects are fetched by id alone, so
-  these tokens are limited to `/file`, `/ls` and `land`. History metadata
-  (`/log`, `/changes`) is visible to every token.
+- **Projections are built on first use.** The first request from a
+  read-scoped token walks the whole history; later ones only project new
+  changes. Caches pass such tokens' requests to the main server, and a read
+  scope can't be widened for an existing clone (clone again).
 - **`status` is ~5–7 ms at 3,000 files, git ~1.5 ms.** What's left is process
   startup (~2.3 ms) and building in-memory maps of every file; a
   memory-mapped index that status could compare without maps would close
