@@ -145,31 +145,18 @@ func writeDiffLine(sb *strings.Builder, op byte, line string) {
 
 // UnifiedDiff renders a unified diff with `ctx` lines of context. It returns
 // "" when there is no difference.
-func UnifiedDiff(name string, a, b []string, ctx int) string {
-	edits := diffEdits(a, b)
+// hunks groups the non-equal edits into hunks with ctx lines of context,
+// returning each hunk's [start, stop) range in edits.
+func hunks(edits []edit, ctx int) [][2]int {
+	var out [][2]int
 	n := len(edits)
-	aPos := make([]int, n+1)
-	bPos := make([]int, n+1)
-	for k, e := range edits {
-		aPos[k+1], bPos[k+1] = aPos[k], bPos[k]
-		if e.op != '+' {
-			aPos[k+1]++
-		}
-		if e.op != '-' {
-			bPos[k+1]++
-		}
-	}
-	var sb strings.Builder
 	i := 0
 	for i < n {
 		if edits[i].op == ' ' {
 			i++
 			continue
 		}
-		start := i - ctx
-		if start < 0 {
-			start = 0
-		}
+		start := max(i-ctx, 0)
 		end, j := i, i
 		for j < n {
 			if edits[j].op != ' ' {
@@ -186,10 +173,32 @@ func UnifiedDiff(name string, a, b []string, ctx int) string {
 			}
 			j = k
 		}
-		stop := end + 1 + ctx
-		if stop > n {
-			stop = n
+		stop := min(end+1+ctx, n)
+		out = append(out, [2]int{start, stop})
+		i = stop
+	}
+	return out
+}
+
+// UnifiedDiff renders a diff; hunks are numbered from 1 so that
+// `commit --hunk path:N` can pick them.
+func UnifiedDiff(name string, a, b []string, ctx int) string {
+	edits := diffEdits(a, b)
+	n := len(edits)
+	aPos := make([]int, n+1)
+	bPos := make([]int, n+1)
+	for k, e := range edits {
+		aPos[k+1], bPos[k+1] = aPos[k], bPos[k]
+		if e.op != '+' {
+			aPos[k+1]++
 		}
+		if e.op != '-' {
+			bPos[k+1]++
+		}
+	}
+	var sb strings.Builder
+	for h, r := range hunks(edits, ctx) {
+		start, stop := r[0], r[1]
 		if sb.Len() == 0 {
 			fmt.Fprintf(&sb, "--- a/%s\n+++ b/%s\n", name, name)
 		}
@@ -201,13 +210,40 @@ func UnifiedDiff(name string, a, b []string, ctx int) string {
 		if bCount == 0 {
 			bStart--
 		}
-		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@\n", aStart, aCount, bStart, bCount)
+		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@ hunk %d\n", aStart, aCount, bStart, bCount, h+1)
 		for _, e := range edits[start:stop] {
 			writeDiffLine(&sb, e.op, e.line)
 		}
-		i = stop
 	}
 	return sb.String()
+}
+
+// applyHunks returns a with only the chosen hunks (numbered from 1, as
+// UnifiedDiff prints them with 3 lines of context) of the change to b applied.
+func applyHunks(a, b []string, keep map[int]bool) ([]string, error) {
+	edits := diffEdits(a, b)
+	hs := hunks(edits, 3)
+	for n := range keep {
+		if n < 1 || n > len(hs) {
+			return nil, fmt.Errorf("no hunk %d (there are %d)", n, len(hs))
+		}
+	}
+	in := make([]bool, len(edits))
+	for h, r := range hs {
+		if keep[h+1] {
+			for k := r[0]; k < r[1]; k++ {
+				in[k] = true
+			}
+		}
+	}
+	var out []string
+	for k, e := range edits {
+		switch {
+		case e.op == ' ', e.op == '-' && !in[k], e.op == '+' && in[k]:
+			out = append(out, e.line)
+		}
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
