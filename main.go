@@ -49,7 +49,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
 
   init [--bare] [-b branch] [dir]     create a repository
   clone [-b branch] [--path dir]... <url> <dir>   lazy (and optionally sparse) working copy
-  commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]...
+  commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]... [path...]
   status [--json]                     working tree vs HEAD, pending conflicts
   log [-n N] [--agent A] [--json] [rev]
   show [rev]                          a change and its diff
@@ -61,7 +61,9 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   resolve (--ours|--theirs|--base) <path>...
   ops                                 operation log
   undo [-f]                           undo the last operation (undo again = redo)
-  audit [--require check] [--json] [rev]   agent-written changes lacking a check
+  audit [--require check] [--signed] [--json] [rev]   agent changes lacking a check or trusted signature
+  keygen                              create a signing key; commits, merges and landings get signed
+  trust [<key> <name>]                list or add keys that audit --signed accepts
   remote add <name> <url> | remote list
   push [-f] [remote] [branch]    fetch [remote] [branch]    pull [remote] [branch]
   land -m msg [--intent s] [--check k=v]... [remote] [branch]
@@ -72,7 +74,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   cat <id>                            print a raw object
   sparse [path...]                    show or change which paths are checked out (none = all)
 
-environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN
+environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
 `)
 }
 
@@ -122,6 +124,13 @@ func run(cmd string, args []string) error {
 		return cmdInit(args)
 	case "serve":
 		return cmdServe(args)
+	case "keygen":
+		path, pub, err := generateKey()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "wrote %s\npublic key: %s\nyour changes are now signed; others can trust you with `sprig trust %s <name>`\n", path, pub, pub)
+		return nil
 	case "clone":
 		return cmdClone(args)
 	}
@@ -174,6 +183,8 @@ func run(cmd string, args []string) error {
 		return cmdCat(r, args)
 	case "sparse":
 		return cmdSparse(r, args)
+	case "trust":
+		return cmdTrust(r, args)
 	}
 	usage()
 	return &exitError{2, fmt.Sprintf("unknown command %q", cmd)}
@@ -307,7 +318,14 @@ func cmdCommit(r *Repo, args []string) error {
 	var id string
 	err = r.Do("commit", func() error {
 		var err error
-		id, err = r.Commit(CommitOpts{Message: *msg, Meta: meta, AllowEmpty: *empty})
+		var paths []string
+		for _, p := range fs.Args() {
+			if p = strings.Trim(filepath.ToSlash(p), "/"); !validPath(p) {
+				return fmt.Errorf("bad path %q", p)
+			}
+			paths = append(paths, p)
+		}
+		id, err = r.Commit(CommitOpts{Message: *msg, Meta: meta, AllowEmpty: *empty, Paths: paths})
 		return err
 	})
 	if errors.Is(err, errNothingToCommit) {
@@ -406,7 +424,7 @@ func fmtTime(c *Change) string {
 	return time.Unix(c.Time, 0).Format("Mon Jan 2 15:04:05 2006 ") + c.TZ
 }
 
-func printChangeHeader(id string, c *Change) {
+func printChangeHeader(r *Repo, id string, c *Change) {
 	tag := ""
 	if len(c.Parents) > 1 {
 		tag = " (merge)"
@@ -434,6 +452,18 @@ func printChangeHeader(id string, c *Change) {
 	}
 	if len(c.Conflicts) > 0 {
 		fmt.Fprintf(stdout, "Conflicts: %d unresolved\n", len(c.Conflicts))
+	}
+	if c.Sig != nil {
+		key, err := r.VerifyChange(c)
+		who := key
+		if name, ok := r.LoadConfig().Trusted[key]; ok {
+			who = name + " (trusted)"
+		}
+		if err != nil {
+			fmt.Fprintf(stdout, "Signed: INVALID (%v) %s\n", err, who)
+		} else {
+			fmt.Fprintf(stdout, "Signed: %s\n", who)
+		}
 	}
 	for _, l := range strings.Split(c.Message, "\n") {
 		fmt.Fprintf(stdout, "\n    %s", l)
@@ -478,7 +508,7 @@ func cmdLog(r *Repo, args []string) error {
 		return printJSON(items)
 	}
 	for _, it := range items {
-		printChangeHeader(it.ID, it.Change)
+		printChangeHeader(r, it.ID, it.Change)
 	}
 	return nil
 }
@@ -541,7 +571,7 @@ func cmdShow(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
-	printChangeHeader(id, c)
+	printChangeHeader(r, id, c)
 	var parent string
 	if len(c.Parents) > 0 {
 		parent = c.Parents[0]
@@ -853,6 +883,7 @@ var passValues = map[string]bool{"pass": true, "passed": true, "ok": true, "appr
 func cmdAudit(r *Repo, args []string) error {
 	fs := newFlags("audit")
 	require := fs.String("require", "review", "check that must be present and passing")
+	signed := fs.Bool("signed", false, "also require a valid signature from a trusted key (see `sprig trust`)")
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -865,11 +896,16 @@ func cmdAudit(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
+	trusted := r.LoadConfig().Trusted
+	if *signed && len(trusted) == 0 {
+		return errors.New("no trusted keys; add one with `sprig trust <key> <name>`")
+	}
 	type finding struct {
 		ID      string `json:"id"`
 		Agent   string `json:"agent"`
 		Model   string `json:"model,omitempty"`
 		Message string `json:"message"`
+		Problem string `json:"problem"`
 	}
 	found := []finding{}
 	total := 0
@@ -878,8 +914,19 @@ func cmdAudit(r *Repo, args []string) error {
 			return true
 		}
 		total++
+		problem := ""
 		if !passValues[strings.ToLower(c.Meta.Checks[*require])] {
-			found = append(found, finding{id, c.Meta.Agent, c.Meta.Model, firstLine(c.Message)})
+			problem = "no passing " + *require + " check"
+		}
+		if *signed && problem == "" {
+			if key, err := r.VerifyChange(c); err != nil {
+				problem = "signature: " + err.Error()
+			} else if _, ok := trusted[key]; !ok {
+				problem = "signed by untrusted key " + key
+			}
+		}
+		if problem != "" {
+			found = append(found, finding{id, c.Meta.Agent, c.Meta.Model, firstLine(c.Message), problem})
 		}
 		return true
 	})
@@ -891,9 +938,13 @@ func cmdAudit(r *Repo, args []string) error {
 			return err
 		}
 	} else {
-		fmt.Fprintf(stdout, "%d of %d agent-authored changes lack a passing %q check\n", len(found), total, *require)
+		what := fmt.Sprintf("a passing %q check", *require)
+		if *signed {
+			what += " or a trusted signature"
+		}
+		fmt.Fprintf(stdout, "%d of %d agent-authored changes lack %s\n", len(found), total, what)
 		for _, f := range found {
-			fmt.Fprintf(stdout, "  %s  %s  %s\n", short(f.ID), f.Agent, f.Message)
+			fmt.Fprintf(stdout, "  %s  %s  %s  (%s)\n", short(f.ID), f.Agent, f.Message, f.Problem)
 		}
 	}
 	if len(found) > 0 {
@@ -1150,6 +1201,27 @@ func cmdSparse(r *Repo, args []string) error {
 	}
 	fmt.Fprintf(stdout, "checked out %d more file(s), removed %d\n", added, removed)
 	return nil
+}
+
+func cmdTrust(r *Repo, args []string) error {
+	cfg := r.LoadConfig()
+	switch {
+	case len(args) == 0:
+		for k, name := range cfg.Trusted {
+			fmt.Fprintf(stdout, "%s\t%s\n", name, k)
+		}
+		return nil
+	case len(args) == 2:
+		if err := checkSig(&Signature{Key: args[0]}, nil); err != nil && err.Error() == "malformed key" {
+			return fmt.Errorf("%q is not a sprig public key (expected ed25519:...)", args[0])
+		}
+		if cfg.Trusted == nil {
+			cfg.Trusted = map[string]string{}
+		}
+		cfg.Trusted[args[0]] = args[1]
+		return r.SaveConfig(cfg)
+	}
+	return errors.New("usage: trust [<key> <name>]")
 }
 
 func cmdCat(r *Repo, args []string) error {
