@@ -16,7 +16,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -111,6 +110,9 @@ type Repo struct {
 	Root string // working tree root ("" for a bare repo)
 	Dir  string // storage directory
 	Bare bool
+	// Durable makes object and ref writes fsync before they count as done.
+	// Servers set it: an acknowledged push or landing must survive a crash.
+	Durable bool
 
 	fallback *Remote // a cache's upstream: missing objects are fetched from it
 }
@@ -231,21 +233,7 @@ func (r *Repo) PutObject(typ string, data []byte) (string, error) {
 	if err := zw.Close(); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	if _, err := tmp.Write(buf.Bytes()); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return "", err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return "", err
-	}
-	if err := os.Rename(tmp.Name(), p); err != nil {
-		os.Remove(tmp.Name())
+	if err := writeFileAtomic(p, buf.Bytes(), r.Durable); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -447,24 +435,50 @@ func (r *Repo) ReadRef(name string) (string, bool) {
 	return id, true
 }
 
-func atomicWrite(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+func atomicWrite(path string, data []byte) error { return writeFileAtomic(path, data, false) }
+
+// writeFileAtomic replaces path in one step (write a temp file, rename it).
+// With durable set it also fsyncs the file before the rename and the
+// directory after it, so the new content survives a crash or power loss.
+func writeFileAtomic(path string, data []byte, durable bool) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+	_, err = tmp.Write(data)
+	if err == nil && durable {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
+	}
+	if err != nil {
 		os.Remove(tmp.Name())
 		return err
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+	if durable {
+		return syncDir(dir)
+	}
+	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) { // some platforms can't sync directories
+		return err
+	}
+	return nil
 }
 
 func (r *Repo) WriteRef(name, id string) error {
@@ -474,22 +488,7 @@ func (r *Repo) WriteRef(name, id string) error {
 	if !isID(id) {
 		return fmt.Errorf("invalid id %q", id)
 	}
-	return atomicWrite(r.refPath(name), []byte(id+"\n"))
-}
-
-// lockRefs takes an exclusive lock shared by every process using this
-// repository, so ref compare-and-swaps from several servers cannot interleave.
-// shortcut: flock is Unix-only and local-disk only; needs a lock service for servers on different machines.
-func (r *Repo) lockRefs() (func(), error) {
-	f, err := os.OpenFile(filepath.Join(r.Dir, "refs.lock"), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return func() { f.Close() }, nil // closing releases the lock
+	return writeFileAtomic(r.refPath(name), []byte(id+"\n"), r.Durable)
 }
 
 func (r *Repo) DeleteRef(name string) error {

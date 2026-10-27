@@ -746,7 +746,7 @@ func (r *Repo) GC(repack bool) (*GCResult, error) {
 	if err := os.Rename(tmp.Name(), name+".pack"); err != nil {
 		return nil, err
 	}
-	if err := atomicWrite(name+".idx", idx); err != nil { // the .idx makes the pack visible
+	if err := writeFileAtomic(name+".idx", idx, true); err != nil { // the .idx makes the pack visible
 		return nil, err
 	}
 	// Read every object back from the new pack itself before letting go of
