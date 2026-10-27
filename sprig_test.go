@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -817,7 +818,8 @@ func TestLandPaths(t *testing.T) {
 func TestScopedTokens(t *testing.T) {
 	srv, _ := InitRepo(t.TempDir(), true, "main")
 	s := NewServer(srv, "full-access-token")
-	s.scopes = map[string][]string{"docs-only-token-123": {"d"}}
+	s.scopes = map[string]Scope{"docs-only-token-123": {Write: []string{"d"}},
+		"read-d-only-token-12": {Read: []string{"d"}}}
 	t.Setenv("SPRIG_TOKEN", "full-access-token")
 	url, _ := seedServer(t, s)
 	f := &LandFile{Mode: "file", Data: []byte("new\n")}
@@ -837,6 +839,28 @@ func TestScopedTokens(t *testing.T) {
 	}
 	if err := land(t, url, "wrong", map[string]*LandFile{"d/x.txt": f}); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("bad token: %v", err)
+	}
+	// read scope: only d/ is visible, and raw objects are off limits
+	ro := newRemote("t", url)
+	ro.Token = "read-d-only-token-12"
+	if data, _, err := ro.do("GET", "/v1/file?path=d/x.txt", nil, nil); err != nil || string(data) != "new\n" {
+		t.Fatalf("in-scope read: %q %v", data, err)
+	}
+	if _, _, err := ro.do("GET", "/v1/file?path=a.txt", nil, nil); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("out-of-scope read: %v", err)
+	}
+	if data, _, err := ro.do("GET", "/v1/ls", nil, nil); err != nil || strings.Contains(string(data), "a.txt") || !strings.Contains(string(data), `"d"`) {
+		t.Fatalf("ls not filtered: %s %v", data, err)
+	}
+	refs, _ := ro.Refs()
+	if _, _, err := ro.GetObject(refs["heads/main"]); err == nil {
+		t.Fatal("read-limited token fetched a raw object")
+	}
+	if err := ro.GetObjects([]string{refs["heads/main"]}, func(string, object) error { return nil }); err == nil {
+		t.Fatal("read-limited token used batch fetch")
+	}
+	if err := land(t, url, "read-d-only-token-12", map[string]*LandFile{"d/x.txt": f}); err == nil {
+		t.Fatal("read-only token landed")
 	}
 }
 
@@ -970,6 +994,17 @@ func TestRenames(t *testing.T) {
 	must(t, "commit", "-m", "rename")
 	if out := must(t, "show"); !strings.Contains(out, "renamed: old.txt -> new.txt") {
 		t.Fatalf("show: %s", out)
+	}
+	write(t, "big.go", "package x\n\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc D() {}\n")
+	must(t, "commit", "-m", "add big")
+	os.Remove("big.go")
+	write(t, "moved.go", "package x\n\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc E() {}\n")
+	if out := must(t, "status"); !strings.Contains(out, "R big.go -> moved.go (edited)") {
+		t.Fatalf("rename with edit not detected: %s", out)
+	}
+	must(t, "commit", "-m", "move and edit")
+	if out := must(t, "show"); !strings.Contains(out, "renamed: big.go -> moved.go") || !strings.Contains(out, "+func E() {}") {
+		t.Fatalf("show of rename+edit: %s", out)
 	}
 }
 
@@ -1137,5 +1172,181 @@ func TestCheckoutNewBranchKeepsWork(t *testing.T) {
 	}
 	if out := must(t, "status"); !strings.Contains(out, "On branch topic") || !strings.Contains(out, "M a.txt") {
 		t.Fatalf("status: %s", out)
+	}
+}
+
+func TestCommitHunks(t *testing.T) {
+	newRepo(t)
+	var lines []string
+	for i := range 20 {
+		lines = append(lines, fmt.Sprint(i))
+	}
+	orig := strings.Join(lines, "\n") + "\n"
+	write(t, "f.txt", orig)
+	must(t, "commit", "-m", "base")
+	edited := strings.Replace(strings.Replace(orig, "1\n", "ONE\n", 1), "18\n", "EIGHTEEN\n", 1)
+	write(t, "f.txt", edited)
+	if out := must(t, "diff"); !strings.Contains(out, "hunk 1") || !strings.Contains(out, "hunk 2") {
+		t.Fatalf("diff should show two numbered hunks: %s", out)
+	}
+	must(t, "commit", "-m", "first hunk only", "--hunk", "f.txt:2")
+	r, _ := FindRepo()
+	_, head := r.Head()
+	flat, _ := r.ChangeFlat(head)
+	got, _ := r.GetBlob(flat["f.txt"].ID)
+	if want := strings.Replace(orig, "18\n", "EIGHTEEN\n", 1); string(got) != want {
+		t.Fatalf("committed %q", got)
+	}
+	if read(t, "f.txt") != edited {
+		t.Fatal("working file changed by a hunk commit")
+	}
+	if _, err := sp(t, "commit", "-m", "x", "--hunk", "f.txt:5"); err == nil {
+		t.Fatal("missing hunk accepted")
+	}
+}
+
+func TestCachesLandOnSeparateDisks(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	var swaps int
+	var mu sync.Mutex
+	h := NewServer(srv, "").Handler()
+	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/v1/land" {
+			t.Error("landing reached the main server; the cache should merge it")
+		}
+		if strings.HasPrefix(req.URL.Path, "/v1/refs/") {
+			mu.Lock()
+			swaps++
+			mu.Unlock()
+		}
+		h.ServeHTTP(w, req)
+	}))
+	defer main.Close()
+	newRepo(t)
+	must(t, "remote", "add", "origin", main.URL)
+	write(t, "a.txt", "a\n")
+	must(t, "commit", "-m", "seed")
+	must(t, "push")
+	swaps = 0
+	var caches []string
+	for range 2 { // each cache has its own, initially empty, store
+		cr, _ := InitRepo(t.TempDir(), true, "main")
+		c := NewServer(cr, "")
+		c.upstream = newRemote("upstream", main.URL)
+		ts := httptest.NewServer(c.Handler())
+		defer ts.Close()
+		caches = append(caches, ts.URL)
+	}
+	errs := make(chan error, 20)
+	for i := range 20 {
+		go func() {
+			errs <- land(t, caches[i%2], "", map[string]*LandFile{fmt.Sprintf("n/%d", i): {Mode: "file", Data: []byte{byte(i)}}})
+		}()
+	}
+	for range 20 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	tip, _ := srv.ReadRef("heads/main")
+	flat, err := srv.ChangeFlat(tip)
+	if err != nil || len(flat) != 21 {
+		t.Fatalf("main server has %d files (%v)", len(flat), err)
+	}
+	if swaps < 20 {
+		t.Fatalf("expected one ref swap per landing, saw %d", swaps)
+	}
+}
+
+func TestGoAwareMerge(t *testing.T) {
+	base := "package x\n\nimport \"strings\"\n\n// A says hi.\nfunc A() string { return strings.ToUpper(\"a\") }\n\nfunc B() int { return 1 }\n"
+	ours := "package x\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\n// A says hi.\nfunc A() string { return fmt.Sprint(strings.ToUpper(\"a\")) }\n\nfunc B() int { return 1 }\n\nfunc C() {}\n"
+	theirs := "package x\n\nimport (\n\t\"os\"\n\t\"strings\"\n)\n\n// A says hi.\nfunc A() string { return strings.ToUpper(\"a\") }\n\nfunc B() int { return len(os.Args) }\n\nfunc D() {}\n"
+	if res := Merge3(splitLines([]byte(base)), splitLines([]byte(ours)), splitLines([]byte(theirs)), "o", "t"); res.Conflicts == 0 {
+		t.Fatal("test needs a case the line merge cannot do")
+	}
+	got, ok := goMerge([]byte(base), []byte(ours), []byte(theirs))
+	if !ok {
+		t.Fatal("Go-aware merge gave up")
+	}
+	for _, want := range []string{`"fmt"`, `"os"`, `"strings"`, "fmt.Sprint(", "len(os.Args)", "func C()", "func D()", "// A says hi."} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("merged file lacks %s:\n%s", want, got)
+		}
+	}
+	// same function changed incompatibly: no silent pick
+	o2 := strings.Replace(base, "return 1", "return 2", 1)
+	t2 := strings.Replace(base, "return 1", "return 3", 1)
+	if _, ok := goMerge([]byte(base), []byte(o2), []byte(t2)); ok {
+		t.Fatal("conflicting edits to one function merged")
+	}
+	// end to end through sprig merge
+	newRepo(t)
+	write(t, "x.go", base)
+	must(t, "commit", "-m", "base")
+	must(t, "checkout", "-b", "other")
+	write(t, "x.go", theirs)
+	must(t, "commit", "-m", "theirs")
+	must(t, "checkout", "main")
+	write(t, "x.go", ours)
+	must(t, "commit", "-m", "ours")
+	if out, err := sp(t, "merge", "other"); err != nil {
+		t.Fatalf("merge conflicted: %v %s", err, out)
+	}
+	if !strings.Contains(read(t, "x.go"), "func D()") {
+		t.Fatal("merge result missing theirs")
+	}
+}
+
+func TestGCPacks(t *testing.T) {
+	if d := makeDelta([]byte("a\nbb\ncc\n"), []byte("a\nbb\nXX\ncc\n")); true {
+		got, err := applyDelta([]byte("a\nbb\ncc\n"), d)
+		if err != nil || string(got) != "a\nbb\nXX\ncc\n" {
+			t.Fatalf("delta round trip: %q %v", got, err)
+		}
+	}
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, _ := seedServer(t, NewServer(srv, ""))
+	var body strings.Builder
+	for i := range 400 {
+		fmt.Fprintf(&body, "%d %s\n", i, HashObject("x", []byte(fmt.Sprint(i)))) // poorly compressible
+	}
+	for i := range 15 { // many versions of one file, plus a revert
+		write(t, "big.txt", body.String()+strings.Repeat("edit\n", i%7))
+		must(t, "commit", "-m", fmt.Sprint("v", i))
+	}
+	before := must(t, "log", "--json", "-n", "100")
+	out := must(t, "gc")
+	r, _ := FindRepo()
+	var kb1, kb2 int
+	fmt.Sscanf(out[strings.Index(out, ": ")+2:], "%d KB -> %d KB", &kb1, &kb2)
+	if !strings.Contains(out, "as deltas") || kb2*3 > kb1 {
+		t.Fatalf("gc did not shrink storage much: %s", out)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(r.Dir, "objects")); len(ents) != 0 {
+		t.Fatalf("loose objects left: %d dirs", len(ents))
+	}
+	if after := must(t, "log", "--json", "-n", "100"); after != before {
+		t.Fatal("history reads differently after gc")
+	}
+	if out := must(t, "status"); !strings.Contains(out, "clean") {
+		t.Fatalf("status after gc: %s", out)
+	}
+	_, head := r.Head()
+	if _, err := r.ResolveRev(head[:10]); err != nil {
+		t.Fatalf("short id of a packed change: %v", err)
+	}
+	// keeps working: new commits, a second gc, and serving from a packed repo
+	write(t, "big.txt", "rewritten\n")
+	must(t, "commit", "-m", "after gc")
+	must(t, "gc")
+	must(t, "push")
+	if _, err := srv.GC(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	must(t, "clone", url, "w")
+	if read(t, "w/big.txt") != "rewritten\n" {
+		t.Fatal("clone from a packed server failed")
 	}
 }
