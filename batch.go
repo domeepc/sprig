@@ -42,7 +42,7 @@ func readRecords(r io.Reader, fn func(id string, o object) error) error {
 			return fmt.Errorf("truncated object stream")
 		}
 		f := strings.Fields(line)
-		if len(f) != 3 || !idRe.MatchString(f[0]) {
+		if len(f) != 3 || !isID(f[0]) {
 			return fmt.Errorf("bad record header %q", strings.TrimSpace(line))
 		}
 		n, err := strconv.Atoi(f[2])
@@ -65,6 +65,9 @@ func readRecords(r io.Reader, fn func(id string, o object) error) error {
 // handleGetObjects returns the requested objects it has, stopping early once
 // the response is large; the client asks again for the rest.
 func (s *Server) handleGetObjects(w http.ResponseWriter, req *http.Request) {
+	if readLimited(w, req) {
+		return
+	}
 	var body struct {
 		IDs []string `json:"ids"`
 	}
@@ -77,7 +80,7 @@ func (s *Server) handleGetObjects(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	for _, id := range body.IDs {
-		if !idRe.MatchString(id) {
+		if !isID(id) {
 			httpErr(w, 400, "bad id %q", id)
 			return
 		}
@@ -116,6 +119,9 @@ func (s *Server) handleGetObjects(w http.ResponseWriter, req *http.Request) {
 // handlePutObjects stores a record stream in order. Each object's
 // dependencies must already be stored, here or earlier in the same stream.
 func (s *Server) handlePutObjects(w http.ResponseWriter, req *http.Request) {
+	if readLimited(w, req) {
+		return
+	}
 	n := 0
 	err := readRecords(http.MaxBytesReader(w, req.Body, batchBytes+maxObjectSize), func(id string, o object) error {
 		if msg := s.checkObject(o.typ, o.data); msg != "" {

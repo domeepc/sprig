@@ -12,6 +12,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,9 +25,9 @@ import (
 
 type Server struct {
 	repo     *Repo
-	token    string              // full access
-	scopes   map[string][]string // token -> path prefixes it may land in
-	upstream *Remote             // set when this server is a cache in front of another
+	token    string           // full access
+	scopes   map[string]Scope // limited tokens
+	upstream *Remote          // set when this server is a cache in front of another
 }
 
 const maxObjectSize = 256 << 20
@@ -33,6 +35,52 @@ const maxObjectSize = 256 << 20
 func NewServer(r *Repo, token string) *Server { return &Server{repo: r, token: token} }
 
 type scopeKey struct{}
+
+// Scope limits a token. In tokens.json a plain list means Write only.
+type Scope struct {
+	Write []string `json:"write"`          // path prefixes it may land in
+	Read  []string `json:"read,omitempty"` // if set, the only paths it may read
+}
+
+func (sc *Scope) UnmarshalJSON(b []byte) error {
+	var list []string
+	if json.Unmarshal(b, &list) == nil {
+		sc.Write = list
+		return nil
+	}
+	type plain Scope
+	return json.Unmarshal(b, (*plain)(sc))
+}
+
+func scopeOf(req *http.Request) (Scope, bool) {
+	sc, ok := req.Context().Value(scopeKey{}).(Scope)
+	return sc, ok
+}
+
+// readLimited reports whether the request's token may only read some paths.
+// Such tokens get no object-level access: objects are addressed by id alone,
+// so there is no path to check them against.
+func readLimited(w http.ResponseWriter, req *http.Request) bool {
+	if sc, ok := scopeOf(req); ok && sc.Read != nil {
+		httpErr(w, 403, "this token may only read files through /v1/file and /v1/ls")
+		return true
+	}
+	return false
+}
+
+// mayRead reports whether path p, or something below it, is readable.
+func mayRead(req *http.Request, p string) (whole, part bool) {
+	sc, ok := scopeOf(req)
+	if !ok || sc.Read == nil || inScope(sc.Read, p) {
+		return true, true
+	}
+	for _, pre := range sc.Read {
+		if p == "" || strings.HasPrefix(pre, p+"/") {
+			return false, true
+		}
+	}
+	return false, false
+}
 
 func inScope(scope []string, p string) bool {
 	for _, pre := range scope {
@@ -48,11 +96,13 @@ func (s *Server) Handler() http.Handler {
 	if s.upstream != nil {
 		// Cache tier: objects never change, so they are served locally once
 		// fetched; everything else (refs, landing, log, ...) goes upstream.
+		s.repo.fallback = s.upstream
 		u, _ := url.Parse(s.upstream.URL)
 		mux.Handle("/v1/", &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(u) }})
 		mux.HandleFunc("GET /v1/object/{id}", s.handleGetObject)
 		mux.HandleFunc("GET /v1/changes/{id}", s.handleChange)
 		mux.HandleFunc("POST /v1/objects/get", s.handleGetObjects)
+		mux.HandleFunc("POST /v1/land", s.handleLand) // merge here; only the ref swap goes upstream
 		return s.auth(mux)
 	}
 	mux.HandleFunc("GET /v1/refs", s.handleRefs)
@@ -116,8 +166,11 @@ func (s *Server) fill(id string) {
 }
 
 func (s *Server) handleGetObject(w http.ResponseWriter, req *http.Request) {
+	if readLimited(w, req) {
+		return
+	}
 	id := req.PathValue("id")
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		httpErr(w, 400, "bad id")
 		return
 	}
@@ -133,8 +186,11 @@ func (s *Server) handleGetObject(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Server) handlePutObject(w http.ResponseWriter, req *http.Request) {
+	if readLimited(w, req) {
+		return
+	}
 	id, typ := req.PathValue("id"), req.Header.Get("X-Sprig-Type")
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		httpErr(w, 400, "bad id")
 		return
 	}
@@ -159,6 +215,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Server) handleMissing(w http.ResponseWriter, req *http.Request) {
+	if readLimited(w, req) {
+		return
+	}
 	var body struct {
 		IDs []string `json:"ids"`
 	}
@@ -172,7 +231,7 @@ func (s *Server) handleMissing(w http.ResponseWriter, req *http.Request) {
 	}
 	missing := []string{}
 	for _, id := range body.IDs {
-		if !idRe.MatchString(id) {
+		if !isID(id) {
 			httpErr(w, 400, "bad id %q", id)
 			return
 		}
@@ -200,7 +259,7 @@ func (s *Server) handleUpdateRef(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "bad json")
 		return
 	}
-	if _, scoped := req.Context().Value(scopeKey{}).([]string); scoped {
+	if _, scoped := scopeOf(req); scoped {
 		httpErr(w, 403, "this token may only land changes, not move refs")
 		return
 	}
@@ -301,7 +360,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "a message is required")
 		return
 	}
-	if u.Base != "" && !idRe.MatchString(u.Base) {
+	if u.Base != "" && !isID(u.Base) {
 		httpErr(w, 400, "bad base id")
 		return
 	}
@@ -310,7 +369,8 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "unknown base change %s", short(u.Base))
 		return
 	}
-	scope, scoped := req.Context().Value(scopeKey{}).([]string)
+	sc, scoped := scopeOf(req)
+	scope := sc.Write
 	// Only the edited paths are looked at, so a landing costs the same in a
 	// small repo and a huge one.
 	base, ours := Flat{}, Flat{}
@@ -366,7 +426,11 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		u.Author = "unknown <unknown@localhost>"
 	}
 	for retries := 0; retries < maxLandRetries; retries++ {
-		tip, _ := s.repo.ReadRef(name)
+		tip, err := s.readRef(name)
+		if err != nil {
+			httpErr(w, 502, "%v", err)
+			return
+		}
 		tipTree, err := s.treeOf(tip)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
@@ -426,26 +490,109 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 			httpErr(w, 500, "%v", err)
 			return
 		}
-		unlock, err := s.repo.lockRefs()
+		if s.upstream != nil {
+			if err := s.publish(id, tree, edits); err != nil {
+				httpErr(w, 502, "%v", err)
+				return
+			}
+		}
+		moved, err := s.swapRef(name, tip, id)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
 		}
-		cur, _ := s.repo.ReadRef(name)
-		if cur != tip {
-			unlock()
+		if moved {
 			continue // someone landed meanwhile: re-merge onto the new tip
-		}
-		err = s.repo.WriteRef(name, id)
-		unlock()
-		if err != nil {
-			httpErr(w, 500, "%v", err)
-			return
 		}
 		writeJSON(w, 200, LandResult{id, tip, retries})
 		return
 	}
 	httpErr(w, 503, "%s moved %d times during landing; try again", u.Branch, maxLandRetries)
+}
+
+// readRef reads a branch tip, from upstream when this server is a cache.
+func (s *Server) readRef(name string) (string, error) {
+	if s.upstream == nil {
+		id, _ := s.repo.ReadRef(name)
+		return id, nil
+	}
+	refs, err := s.upstream.Refs()
+	return refs[name], err
+}
+
+// swapRef moves name from old to new, reporting moved=true if it no longer
+// pointed at old. A cache sends this one compare-and-swap upstream; it is the
+// only step of a landing that the authoritative server has to do itself.
+func (s *Server) swapRef(name, old, new string) (moved bool, err error) {
+	if s.upstream != nil {
+		err := s.upstream.UpdateRef(name, old, new, false)
+		var re *remoteError
+		if errors.As(err, &re) && re.Code == 409 && strings.HasPrefix(re.Msg, "ref moved") {
+			return true, nil
+		}
+		return false, err
+	}
+	unlock, err := s.repo.lockRefs()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if cur, _ := s.repo.ReadRef(name); cur != old {
+		return true, nil
+	}
+	return false, s.repo.WriteRef(name, new)
+}
+
+// publish uploads what a landing created (the edited files, the directories
+// along their paths, the change) to upstream, dependencies first.
+func (s *Server) publish(id, tree string, edits map[string]*FileEnt) error {
+	var blobs, trees []string
+	depth := map[string]int{}
+	for p, fe := range edits {
+		if fe != nil {
+			blobs = append(blobs, fe.ID)
+		}
+		parts := strings.Split(p, "/")
+		cur := tree
+		for d := 0; cur != ""; d++ {
+			if _, ok := depth[cur]; !ok {
+				trees = append(trees, cur)
+			}
+			depth[cur] = max(depth[cur], d)
+			if d == len(parts)-1 {
+				break
+			}
+			fe, ok, err := s.repo.lookup(tree, strings.Join(parts[:d+1], "/"))
+			if err != nil {
+				return err
+			}
+			if !ok || fe.Mode != "dir" {
+				break
+			}
+			cur = fe.ID
+		}
+	}
+	sort.Slice(trees, func(i, j int) bool { return depth[trees[i]] > depth[trees[j]] })
+	order := append(append(blobs, trees...), id)
+	missing, err := s.upstream.Missing(order)
+	if err != nil {
+		return err
+	}
+	need := map[string]bool{}
+	for _, m := range missing {
+		need[m] = true
+	}
+	var send []string
+	for _, o := range order {
+		if need[o] {
+			send = append(send, o)
+			need[o] = false
+		}
+	}
+	return s.upstream.PutObjects(send, func(id string) (object, error) {
+		typ, data, err := s.repo.GetObject(id)
+		return object{typ, data}, err
+	})
 }
 
 func (s *Server) treeOf(changeID string) (string, error) {
@@ -495,7 +642,7 @@ func (s *Server) handleLog(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) handleChange(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
-	if idRe.MatchString(id) {
+	if isID(id) {
 		s.fill(id)
 	}
 	c, err := s.repo.GetChange(id)
@@ -513,6 +660,10 @@ func (s *Server) handleFile(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	p := strings.Trim(req.URL.Query().Get("path"), "/")
+	if whole, _ := mayRead(req, p); !whole {
+		httpErr(w, 403, "this token may not read %q", p)
+		return
+	}
 	flat, err := s.repo.ChangeFlat(id)
 	if err != nil {
 		httpErr(w, 500, "%v", err)
@@ -540,6 +691,10 @@ func (s *Server) handleLs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	prefix := strings.Trim(req.URL.Query().Get("path"), "/")
+	if _, part := mayRead(req, prefix); !part {
+		httpErr(w, 403, "this token may not read %q", prefix)
+		return
+	}
 	flat, err := s.repo.ChangeFlat(id)
 	if err != nil {
 		httpErr(w, 500, "%v", err)
@@ -554,10 +709,16 @@ func (s *Server) handleLs(w http.ResponseWriter, req *http.Request) {
 			}
 			rest = strings.TrimPrefix(p, prefix+"/")
 		}
+		name, mode := rest, fe.Mode
 		if i := strings.Index(rest, "/"); i >= 0 {
-			seen[rest[:i]] = "dir"
-		} else {
-			seen[rest] = fe.Mode
+			name, mode = rest[:i], "dir"
+		}
+		full := name
+		if prefix != "" {
+			full = prefix + "/" + name
+		}
+		if _, part := mayRead(req, full); part {
+			seen[name] = mode
 		}
 	}
 	writeJSON(w, 200, map[string]any{"entries": seen})
@@ -858,22 +1019,28 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 		return "", 0, fmt.Errorf("remote has no branch %q", branch)
 	}
 	lazy := r.LoadConfig().Lazy != ""
-	// Download level by level, one batched request per level, then store
-	// dependencies first so a partial fetch never looks complete.
-	// shortcut: holds the whole fetch in memory; stream to a staging area for very large fetches.
-	got := map[string]object{}
+	// Download level by level, one batched request per level, into a staging
+	// store; then move objects in, dependencies first, so a partial fetch
+	// never looks complete. Only ids are kept in memory.
+	stageDir, err := os.MkdirTemp(r.Dir, ".fetch-")
+	if err != nil {
+		return "", 0, err
+	}
+	defer os.RemoveAll(stageDir)
+	stage := &Repo{Dir: stageDir, Bare: true}
+	got := map[string]bool{}
 	kids := map[string][]string{}
 	for level := []string{tip}; len(level) > 0; {
 		var want []string
 		for _, id := range level {
-			if _, ok := got[id]; !ok && !r.HasObject(id) {
-				got[id] = object{}
+			if !got[id] && !r.HasObject(id) {
+				got[id] = true
 				want = append(want, id)
 			}
 		}
 		level = nil
 		err := rm.GetObjects(want, func(id string, o object) error {
-			if _, asked := got[id]; !asked {
+			if !got[id] {
 				return fmt.Errorf("remote sent unrequested object %s", short(id))
 			}
 			ks, err := Children(o.typ, o.data)
@@ -892,7 +1059,10 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 					}
 				}
 			}
-			got[id], kids[id] = o, ks
+			if _, err := stage.PutObject(o.typ, o.data); err != nil {
+				return err
+			}
+			kids[id] = ks
 			level = append(level, ks...)
 			return nil
 		})
@@ -903,8 +1073,7 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 	stored := map[string]bool{}
 	var store func(string) error
 	store = func(id string) error {
-		o, ok := got[id]
-		if !ok || stored[id] {
+		if !got[id] || stored[id] {
 			return nil // already present locally
 		}
 		stored[id] = true
@@ -913,8 +1082,10 @@ func (r *Repo) Fetch(rm *Remote, branch string) (string, int, error) {
 				return err
 			}
 		}
-		_, err := r.PutObject(o.typ, o.data)
-		return err
+		if err := os.MkdirAll(filepath.Dir(r.objPath(id)), 0o755); err != nil {
+			return err
+		}
+		return os.Rename(stage.objPath(id), r.objPath(id)) // same format, same filesystem
 	}
 	if err := store(tip); err != nil {
 		return "", len(stored), err
