@@ -132,6 +132,7 @@ func TestStoreIntegrity(t *testing.T) {
 	other, _ := r.PutBlob([]byte("evil"))
 	b, _ := os.ReadFile(r.objPath(other))
 	os.WriteFile(r.objPath(id), b, 0o644)
+	dropCaches() // a cached copy is the verified original; this checks what is on disk
 	if _, err := r.GetBlob(id); err == nil || !strings.Contains(err.Error(), "corrupt") {
 		t.Fatalf("tampering not detected: %v", err)
 	}
@@ -1866,5 +1867,106 @@ func TestProjectedClone(t *testing.T) {
 	refs2, _ := newRemote("t", url).Refs()
 	if refs1["heads/main"] != refs2["heads/main"] || refs1["heads/main"] == "" {
 		t.Fatalf("projection changed after reload: %v vs %v", refs1, refs2)
+	}
+}
+
+func TestDiffTreesMatchesFlat(t *testing.T) {
+	newRepo(t)
+	r, _ := FindRepo()
+	mk := func(files map[string]string) (string, Flat) {
+		f := Flat{}
+		for p, c := range files {
+			id, _ := r.PutBlob([]byte(c))
+			f[p] = FileEnt{"file", id}
+		}
+		tree, err := r.BuildTree(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tree, f
+	}
+	ta, fa := mk(map[string]string{"a": "1", "d/x": "2", "d/y": "3", "e/f/g": "4", "same/s": "5", "file-then-dir": "6"})
+	tb, fb := mk(map[string]string{"a": "1!", "d/x": "2", "e/new": "7", "same/s": "5", "file-then-dir/inside": "8", "n/m": "9"})
+	got, err := r.DiffTrees(ta, tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := DiffFlat(fa, fb)
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("tree diff differs from flat diff:\n got %v\nwant %v", got, want)
+	}
+	if empty, _ := r.DiffTrees("", tb); len(empty) != len(fb) {
+		t.Fatalf("diff from nothing: %d entries", len(empty))
+	}
+}
+
+func TestStatusFastPathMatchesFull(t *testing.T) {
+	newRepo(t)
+	t.Setenv("SPRIG_NO_WATCH", "")
+	for i := range 40 {
+		write(t, fmt.Sprintf("d%d/f%d.txt", i%4, i), fmt.Sprint(i))
+	}
+	write(t, "keep.txt", "k")
+	must(t, "commit", "-m", "base")
+	r, _ := FindRepo()
+	stop := make(chan struct{})
+	ready := make(chan struct{})
+	go r.Watch(stop, func() { close(ready) })
+	defer close(stop)
+	<-ready
+	time.Sleep(1100 * time.Millisecond) // the memo's start time must fall inside what the watcher vouches for
+	must(t, "status")                   // writes the memo
+	check := func(step string) {
+		t.Helper()
+		time.Sleep(150 * time.Millisecond) // let the watcher see the events
+		t.Setenv("SPRIG_NO_WATCH", "1")
+		full := must(t, "status", "--json")
+		t.Setenv("SPRIG_NO_WATCH", "")
+		fast := must(t, "status", "--json")
+		if fast != full {
+			t.Fatalf("%s: fast status differs\nfast: %s\nfull: %s", step, fast, full)
+		}
+	}
+	write(t, "d1/f1.txt", "edited")
+	check("edit")
+	os.Remove("d2/f2.txt")
+	check("delete")
+	write(t, "newdir/a/b.txt", "new")
+	check("new directory")
+	write(t, "d1/f1.txt", "1") // back to HEAD's content
+	check("revert")
+	os.RemoveAll("d3")
+	check("delete directory")
+	write(t, ".sprigignore", "newdir\n")
+	check("ignore file changed")
+	// the fast path really is taken: with a clean tree, no full listing is needed
+	if out := must(t, "status"); !strings.Contains(out, "d2/f2.txt") {
+		t.Fatalf("status: %s", out)
+	}
+}
+
+func TestStatusAfterOtherCommandSavesCache(t *testing.T) {
+	newRepo(t)
+	t.Setenv("SPRIG_NO_WATCH", "1")
+	write(t, "f.txt", "one\n")
+	write(t, "g.txt", "g\n")
+	must(t, "commit", "-m", "base")
+	past := time.Now().Add(-time.Minute)
+	os.Chtimes("f.txt", past, past)
+	os.Chtimes("g.txt", past, past)
+	must(t, "status") // memo: clean
+	must(t, "status") // and the fast walk agrees
+	write(t, "f.txt", "two\n")
+	os.Chtimes("f.txt", past.Add(time.Second), past.Add(time.Second))
+	must(t, "diff") // saves the stat cache with f's new state
+	if out := must(t, "status"); !strings.Contains(out, "M f.txt") {
+		t.Fatalf("edit hidden by a cache another command saved: %s", out)
+	}
+	if out := must(t, "status"); !strings.Contains(out, "M f.txt") {
+		t.Fatalf("edit lost on the second status: %s", out)
+	}
+	os.Remove("g.txt")
+	if out := must(t, "status"); !strings.Contains(out, "D g.txt") || !strings.Contains(out, "M f.txt") {
+		t.Fatalf("deletion missed by the stat walk: %s", out)
 	}
 }
