@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -117,7 +118,7 @@ func (r *Repo) loadFlatMemo(treeID string) (Flat, bool) {
 	if lines[0] != treeID {
 		return nil, false
 	}
-	out := Flat{}
+	out := make(Flat, len(lines))
 	for _, l := range lines[1:] {
 		f := strings.Split(l, "\t")
 		if len(f) != 3 {
@@ -460,97 +461,211 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 	if r.Bare {
 		return nil, errors.New("bare repository has no working tree")
 	}
-	pats := r.loadIgnore()
-	cfg := r.LoadConfig()
 	cache := r.loadStatCache()
-	fresh := statCache{Written: time.Now().UnixNano(), Files: map[string]statEntry{}, dirty: len(cache.Files) == 0}
-	flat := Flat{}
-	err := filepath.WalkDir(r.Root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(r.Root, p)
-		rel = filepath.ToSlash(rel)
-		if rel == "." {
-			return nil
-		}
-		if d.IsDir() {
-			if d.Name() == ".sprig" || d.Name() == ".git" || ignored(pats, rel) || !cfg.dirInView(rel) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if ignored(pats, rel) || !cfg.inView(rel) {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		mode := "file"
-		switch {
-		case info.Mode()&fs.ModeSymlink != 0:
-			mode = "link"
-		case !info.Mode().IsRegular():
-			return nil // sockets, devices, ...
-		case info.Mode()&0o111 != 0:
-			mode = "exec"
-		}
-		// Unchanged size, mtime and mode: reuse the recorded hash instead of
-		// reading the file. Entries written less than a second before the
-		// cache was saved are not trusted, since an edit within the same
-		// timestamp tick would be invisible ("racily clean", as git calls it).
-		st := statEntry{info.Size(), info.ModTime().UnixNano(), mode, ""}
-		if e, ok := cache.Files[rel]; ok && e.Size == st.Size && e.MTime == st.MTime && e.Mode == mode &&
-			e.MTime < cache.Written-int64(time.Second) && (!store || r.HasObject(e.ID)) {
-			flat[rel] = FileEnt{mode, e.ID}
-			fresh.Files[rel] = e
-			return nil
-		}
-		var data []byte
-		switch {
-		case info.Mode()&fs.ModeSymlink != 0:
-			target, err := os.Readlink(p)
-			if err != nil {
-				return err
-			}
-			data = []byte(target)
-		default:
-			data, err = os.ReadFile(p)
-			if err != nil {
-				return err
-			}
-		}
-		var id string
-		if store {
-			id, err = r.PutBlob(data)
-			if err != nil {
-				return err
-			}
-		} else {
-			id = HashObject(TypeBlob, data)
-		}
-		flat[rel] = FileEnt{mode, id}
-		st.ID = id
-		fresh.Files[rel] = st
-		fresh.dirty = true
-		return nil
-	})
-	if err == nil && (fresh.dirty || len(fresh.Files) != len(cache.Files)) {
-		r.saveStatCache(fresh)
+	n := len(cache.Files)
+	s := &snapper{r: r, store: store, pats: r.loadIgnore(), cfg: r.LoadConfig(), cache: cache, flat: make(Flat, n),
+		fresh: statCache{Written: time.Now().UnixNano(), Files: make(map[string]statEntry, n), dirty: n == 0}}
+	var err error
+	dirty, ok, watched := r.askWatcher(cache)
+	if ok {
+		err = s.fromWatcher(dirty)
+	} else {
+		err = s.walk(r.Root, "")
+		s.fresh.dirty = s.fresh.dirty || watched // a save the watcher can vouch for next time
 	}
-	if err != nil || len(cfg.Sparse) == 0 {
+	if err == nil && (s.fresh.dirty || len(s.fresh.Files) != len(cache.Files)) {
+		r.saveStatCache(s.fresh)
+	}
+	flat := s.flat
+	if err != nil || len(s.cfg.Sparse) == 0 {
 		return flat, err
 	}
 	// outside a sparse view, files are whatever HEAD says
 	_, head := r.Head()
 	hf, err := r.ChangeFlat(head)
 	for p, fe := range hf {
-		if !cfg.inView(p) {
+		if !s.cfg.inView(p) {
 			flat[p] = fe
 		}
 	}
 	return flat, err
+}
+
+// snapper reads the working tree into a Flat, several directories at once.
+type snapper struct {
+	r     *Repo
+	store bool
+	pats  []string
+	cfg   Config
+	cache statCache
+
+	mu    sync.Mutex
+	flat  Flat
+	fresh statCache
+}
+
+func (s *snapper) skipDir(name, rel string) bool {
+	return name == ".sprig" || name == ".git" || ignored(s.pats, rel) || !s.cfg.dirInView(rel)
+}
+
+func (s *snapper) skipFile(rel string) bool { return ignored(s.pats, rel) || !s.cfg.inView(rel) }
+
+// walk snapshots everything under dir (rel is its repo-relative path, "" for
+// the root), handing subdirectories to other goroutines while slots are free.
+func (s *snapper) walk(dir, rel string) error {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	var errMu sync.Mutex
+	var first error
+	fail := func(err error) {
+		errMu.Lock()
+		if first == nil {
+			first = err
+		}
+		errMu.Unlock()
+	}
+	var visit func(dir, rel string)
+	visit = func(dir, rel string) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				fail(err)
+			}
+			return
+		}
+		for _, d := range ents {
+			crel := d.Name()
+			if rel != "" {
+				crel = rel + "/" + d.Name()
+			}
+			cdir := filepath.Join(dir, d.Name())
+			if d.IsDir() {
+				if s.skipDir(d.Name(), crel) {
+					continue
+				}
+				select {
+				case sem <- struct{}{}:
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						defer func() { <-sem }()
+						visit(cdir, crel)
+					}()
+				default:
+					visit(cdir, crel)
+				}
+				continue
+			}
+			if s.skipFile(crel) {
+				continue
+			}
+			info, err := d.Info()
+			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) { // deleted while walking: just absent
+					fail(err)
+				}
+				continue
+			}
+			if err := s.file(cdir, crel, info); err != nil {
+				fail(err)
+			}
+		}
+	}
+	visit(dir, rel)
+	wg.Wait()
+	return first
+}
+
+// file records one working file, reusing the stat cache's hash when the
+// file's size, mtime and mode are unchanged.
+func (s *snapper) file(abs, rel string, info fs.FileInfo) error {
+	mode := "file"
+	switch {
+	case info.Mode()&fs.ModeSymlink != 0:
+		mode = "link"
+	case !info.Mode().IsRegular():
+		return nil // sockets, devices, ...
+	case info.Mode()&0o111 != 0:
+		mode = "exec"
+	}
+	// Entries written less than a second before the cache was saved are not
+	// trusted, since an edit within the same timestamp tick would be
+	// invisible ("racily clean", as git calls it).
+	st := statEntry{info.Size(), info.ModTime().UnixNano(), mode, ""}
+	if e, ok := s.cache.Files[rel]; ok && e.Size == st.Size && e.MTime == st.MTime && e.Mode == mode &&
+		e.MTime < s.cache.Written-int64(time.Second) && (!s.store || s.r.HasObject(e.ID)) {
+		s.put(rel, e, false)
+		return nil
+	}
+	var data []byte
+	var err error
+	if mode == "link" {
+		target, err := os.Readlink(abs)
+		if err != nil {
+			return err
+		}
+		data = []byte(target)
+	} else if data, err = os.ReadFile(abs); err != nil {
+		return err
+	}
+	if s.store {
+		if st.ID, err = s.r.PutBlob(data); err != nil {
+			return err
+		}
+	} else {
+		st.ID = HashObject(TypeBlob, data)
+	}
+	s.put(rel, st, true)
+	return nil
+}
+
+// fromWatcher builds the snapshot from the stat cache plus the paths a
+// watcher reported changed; only those are looked at on disk. Cache entries
+// are trusted even inside the racy window, since the watcher covers it.
+func (s *snapper) fromWatcher(dirty []string) error {
+	for p, e := range s.cache.Files {
+		if !s.skipFile(p) {
+			s.flat[p] = FileEnt{e.Mode, e.ID}
+			s.fresh.Files[p] = e
+		}
+	}
+	for _, d := range dirty {
+		for p := range s.flat { // the path, or a directory's old contents, may be gone
+			if p == d || strings.HasPrefix(p, d+"/") {
+				delete(s.flat, p)
+				delete(s.fresh.Files, p)
+				s.fresh.dirty = true
+			}
+		}
+	}
+	for _, d := range dirty {
+		abs := s.r.abs(d)
+		info, err := os.Lstat(abs)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return err
+		case info.IsDir():
+			if !s.skipDir(info.Name(), d) {
+				if err := s.walk(abs, d); err != nil {
+					return err
+				}
+			}
+		case !s.skipFile(d):
+			if err := s.file(abs, d, info); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *snapper) put(rel string, e statEntry, changed bool) {
+	s.mu.Lock()
+	s.flat[rel] = FileEnt{e.Mode, e.ID}
+	s.fresh.Files[rel] = e
+	s.fresh.dirty = s.fresh.dirty || changed
+	s.mu.Unlock()
 }
 
 // The stat cache remembers each working file's size, mtime and hash so that
@@ -578,6 +693,7 @@ func (r *Repo) loadStatCache() statCache {
 		return c
 	}
 	lines := strings.Split(string(b), "\n")
+	c.Files = make(map[string]statEntry, len(lines))
 	c.Written, _ = strconv.ParseInt(lines[0], 10, 64)
 	for _, l := range lines[1:] {
 		f := strings.Split(l, "\t")
