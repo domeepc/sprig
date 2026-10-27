@@ -271,7 +271,7 @@ func exportMessage(id string, c *Change) string {
 // sprigTrailer returns the Sprig-Change id from an exported commit message.
 func sprigTrailer(msg string) string {
 	lines := strings.Split(strings.TrimRight(msg, "\n"), "\n")
-	if id, ok := strings.CutPrefix(lines[len(lines)-1], "Sprig-Change: "); ok && idRe.MatchString(id) {
+	if id, ok := strings.CutPrefix(lines[len(lines)-1], "Sprig-Change: "); ok && isID(id) {
 		return id
 	}
 	return ""
