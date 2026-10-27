@@ -69,10 +69,10 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   land -m msg [--intent s] [--check k=v]... [remote] [branch]
                                       send working-tree edits; the server rebases and lands them
   serve [--addr host:port] [--token t] [--tokens file] [--upstream url] [dir]
-  import-git <path-to-git-repo>       convert a git repository's branches
+  import-git [--force] <git-repo>     convert a git repository's branches
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
-  sparse [path...]                    show or change which paths are checked out (none = all)
+  sparse [path... | .]                 show or change which paths are checked out (. = all)
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
 `)

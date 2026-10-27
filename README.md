@@ -5,7 +5,9 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 3,500 lines of Go plus tests, no dependencies outside the standard library.
+Prototype, about 5,400 lines of Go plus 1,100 of tests, no dependencies
+outside the standard library. It needs `git` on the PATH only for
+`import-git`/`export-git`.
 
 ```
 go build -o sprig .
@@ -16,12 +18,13 @@ go test ./...
 
 | Idea | How sprig does it |
 |---|---|
-| **Provenance is structured** | A *change* (sprig's commit) carries `intent`, `agent`, `model`, and `checks` (e.g. `tests=pass`, `review=approved`) as fields, not as text in the message. `sprig log --agent X` and `sprig audit` query them. |
+| **Provenance is structured** | A *change* (sprig's commit) carries `intent`, `agent`, `model`, and `checks` (e.g. `tests=pass`, `review=approved`) as fields, not as text in the message. `sprig log --agent X` and `sprig audit` query them. Changes can be signed (ed25519), so `audit --signed` can tell who really made them. |
 | **Conflicts are data** | A conflicted merge still *completes*. The conflicts are recorded inside the merge change, the files get markers, and you keep working. `sprig conflicts` lists them; they carry forward until the file is fixed. |
 | **Everything is undoable** | Every command that moves a branch or HEAD is written to an operation log with the before/after state. `sprig undo` reverts the last one, including merges, and undoing an undo redoes it. |
 | **API first** | `sprig serve` exposes refs, history, files and directory listings as JSON/HTTP. A CI job can read `main:src/x.go` with one GET. Every CLI command that reads has `--json`. |
+| **Server-side landing** | `sprig land` (or one POST) sends just the edited files; the server merges them onto the current tip and retries if someone landed first. Agents need no clone, and nothing queues behind a global lock. |
 | **Server-side policy** | The server refuses ref updates that are non-fast-forward, point at an unknown change, or whose tip has unresolved conflicts. Objects are hash-verified and only accepted once everything they reference is present, so a ref can never point at partial history. |
-| **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`). |
+| **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths. |
 | **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read. |
 
 ## Quick tour
@@ -32,7 +35,7 @@ echo hello > a.txt
 SPRIG_AGENT=claude sprig commit -m "add greeting" \
     --intent "user asked for a greeting" --model sonnet --check tests=pass
 
-sprig checkout -b feature
+sprig checkout -b feature    # uncommitted edits come along
 ...edit, commit...
 sprig checkout main
 sprig merge feature          # exit code 3 if conflicts were recorded
@@ -192,7 +195,9 @@ sprig push            # fast-forward only unless -f
 sprig pull            # fetch + merge (fast-forwards when possible)
 ```
 
-The server won't listen on a non-loopback address without a token.
+The server won't listen on a non-loopback address without a token (or
+`--tokens`). Remotes must be sprig servers; a GitHub URL is refused with a
+pointer to `export-git` (see above).
 
 API (all paths under `/v1`, bearer token when configured):
 
@@ -203,10 +208,24 @@ API (all paths under `/v1`, bearer token when configured):
 | GET | `/changes/{id}` | one change |
 | GET | `/file?ref=main&path=src/x.go` | file contents |
 | GET | `/ls?ref=main&path=src` | directory listing |
-| GET/PUT | `/object/{id}` | raw object (transport) |
+| GET/PUT | `/object/{id}` | one raw object (transport) |
+| POST | `/objects/get` | many objects `{ids}` as a record stream (transport) |
+| POST | `/objects/put` | upload a record stream, dependencies first (transport) |
 | POST | `/objects/missing` | which of the given ids the server lacks |
-| POST | `/refs/{name}` | compare-and-swap ref update `{old,new,force}` |
-| POST | `/land` | apply edits onto a branch tip server-side (see below) |
+| POST | `/refs/{name}` | compare-and-swap ref update `{old,new,force}` (full-access token only) |
+| POST | `/land` | apply edits onto a branch tip server-side (see Landing) |
+
+A record is `<id> <type> <len>\n` followed by `<len>` bytes; every object is
+hash-checked on arrival.
+
+## Environment
+
+| Variable | Used for |
+|---|---|
+| `SPRIG_AUTHOR` | `Name <email>` on your changes (default: your login `@localhost`) |
+| `SPRIG_AGENT`, `SPRIG_MODEL` | default `--agent` / `--model` for commit and land |
+| `SPRIG_TOKEN` | bearer token for `serve` and for clients; a cache uses it to reach upstream |
+| `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
 
 ## Layout
 
@@ -226,7 +245,8 @@ main.go       CLI
 ## Measured
 
 A synthetic git repo with 3,001 commits and 300 files imports in about 8s;
-afterwards `status` takes 8 ms and `log` 4 ms.
+afterwards `status` takes 8 ms and `log` 4 ms. With 3,000 files, `status` takes
+about 49 ms against git's 4 ms, because sprig re-reads every file (see below).
 
 ## Not done (yet)
 
@@ -244,3 +264,6 @@ afterwards `status` takes 8 ms and `log` 4 ms.
 - **Hidden conflicts in partial clones.** A merge conflict in a file outside
   the view is recorded but not visible on disk; widen with `sprig sparse`.
 - **A fetch is held in memory** until it is complete.
+- **No stat cache.** `status` and `commit` read and hash every file each time,
+  so they slow down linearly with repository size.
+- **Commits are whole-file.** `commit <path>...` picks files, not hunks.
