@@ -513,6 +513,9 @@ func printChangeHeader(r *Repo, id string, c *Change) {
 	if len(c.Conflicts) > 0 {
 		fmt.Fprintf(stdout, "Conflicts: %d unresolved\n", len(c.Conflicts))
 	}
+	if c.Projected != "" {
+		fmt.Fprintf(stdout, "Projected from %s (a read-scoped view of that change)\n", short(c.Projected))
+	}
 	if c.Sig != nil {
 		key, err := r.VerifyChange(c)
 		who := key

@@ -126,6 +126,9 @@ func checkSig(s *Signature, payload []byte) error {
 // VerifyChange checks a change's signature. It returns the signing key, or
 // an error saying why the change is not validly signed.
 func (r *Repo) VerifyChange(c *Change) (string, error) {
+	if c.Projected != "" {
+		return "", fmt.Errorf("projected from %s; verify that change on the server", short(c.Projected))
+	}
 	if c.Sig == nil {
 		return "", errors.New("unsigned")
 	}

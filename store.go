@@ -102,6 +102,7 @@ type Change struct {
 	Meta      Meta       `json:"meta"`
 	Conflicts []Conflict `json:"conflicts,omitempty"`
 	Sig       *Signature `json:"sig,omitempty"`
+	Projected string     `json:"projected_from,omitempty"` // set on a read-scoped view of this real change
 }
 
 // ---------------------------------------------------------------------------
