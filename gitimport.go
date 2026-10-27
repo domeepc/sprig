@@ -150,6 +150,9 @@ func (r *Repo) ImportGit(gitDir string, force bool) (*ImportResult, error) {
 			id := imp.changes[b.sha]
 			name := "heads/" + b.name
 			if cur, ok := r.ReadRef(name); ok && !force {
+				if behind, err := r.IsAncestor(id, cur); err == nil && behind {
+					continue // sprig already has everything git has here
+				}
 				if ff, err := r.IsAncestor(cur, id); err != nil || !ff {
 					// diverged: keep git's side as git/<branch> so it can be merged
 					if err := r.WriteRef("remotes/git/"+b.name, id); err != nil {
