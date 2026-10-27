@@ -368,8 +368,8 @@ func (r *Repo) mergeContent(p string, b FileEnt, hasB bool, o, t FileEnt, mode, 
 		return FileEnt{o.Mode, o.ID}, cf, nil
 	}
 	res := Merge3(splitLines(bd), splitLines(od), splitLines(td), oursLabel, theirsLabel)
-	if res.Conflicts > 0 && strings.HasSuffix(p, ".go") {
-		if merged, ok := goMerge(bd, od, td); ok {
+	if res.Conflicts > 0 {
+		if merged, ok := codeMerge(p, bd, od, td); ok {
 			id, err := r.PutBlob(merged)
 			return FileEnt{mode, id}, nil, err
 		}
