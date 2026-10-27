@@ -77,7 +77,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   import-git [--force] <git-repo>     convert a git repository's branches
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
-  gc                                  pack loose objects, with deltas between file versions
+  gc [--repack]                       pack loose objects with deltas (runs by itself when they pile up)
   watch                               keep a list of changed files so status needn't stat every file
   sparse [path... | .]                 show or change which paths are checked out (. = all)
 
@@ -146,6 +146,10 @@ func run(cmd string, args []string) error {
 		return err
 	}
 	switch cmd {
+	case "commit", "merge", "land", "fetch", "pull", "resolve", "import-git":
+		defer r.maybeAutoGC() // these add objects
+	}
+	switch cmd {
 	case "commit":
 		return cmdCommit(r, args)
 	case "status":
@@ -197,9 +201,24 @@ func run(cmd string, args []string) error {
 			fmt.Fprintf(stdout, "watching %s; status and commit now ask this process (Ctrl-C to stop)\n", r.Root)
 		})
 	case "gc":
-		res, err := r.GC()
+		fs := newFlags("gc")
+		repack := fs.Bool("repack", false, "also merge all existing packs into one")
+		auto := fs.Bool("auto", false, "only run if enough objects have piled up; quiet")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if *auto && !r.needsGC() {
+			return nil
+		}
+		res, err := r.GC(*repack)
+		if *auto {
+			return nil // background run: nobody is reading, and a busy lock is fine
+		}
 		if err != nil {
 			return err
+		}
+		if res.Repacked > 0 {
+			fmt.Fprintf(stdout, "merged %d packs\n", res.Repacked)
 		}
 		fmt.Fprintf(stdout, "packed %d objects (%d as deltas): %d KB -> %d KB\n", res.Packed, res.Deltas, res.Before/1024, res.After/1024)
 		if res.DeletedLooseErr > 0 {
