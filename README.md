@@ -5,7 +5,7 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 5,400 lines of Go plus 1,100 of tests, no dependencies
+Prototype, about 6,600 lines of Go plus 1,400 of tests, no dependencies
 outside the standard library. It needs `git` on the PATH only for
 `import-git`/`export-git`.
 
@@ -24,8 +24,9 @@ go test ./...
 | **API first** | `sprig serve` exposes refs, history, files and directory listings as JSON/HTTP. A CI job can read `main:src/x.go` with one GET. Every CLI command that reads has `--json`. |
 | **Server-side landing** | `sprig land` (or one POST) sends just the edited files; the server merges them onto the current tip and retries if someone landed first. Agents need no clone, and nothing queues behind a global lock. |
 | **Server-side policy** | The server refuses ref updates that are non-fast-forward, point at an unknown change, or whose tip has unresolved conflicts. Objects are hash-verified and only accepted once everything they reference is present, so a ref can never point at partial history. |
-| **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths. |
-| **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read. |
+| **No index** | No staging area. `commit` snapshots the working tree (minus `.sprigignore`); `commit -m msg <path>...` commits only those paths, and `--hunk path:N` only some hunks of a file. |
+| **SHA-256 everywhere** | Objects are `blob`, `tree`, `change`, addressed by SHA-256 and verified on every read, including ones rebuilt from deltas in a pack. |
+| **Merges understand Go** | When a line merge of a `.go` file conflicts, sprig retries per import and per top-level declaration, so two sides adding imports or functions merge cleanly. |
 
 ## Quick tour
 
@@ -47,6 +48,9 @@ sprig undo                   # and forward again
 
 sprig audit --require review # agent-authored changes without a passing review
 sprig commit -m "docs only" README.md docs/   # commit just these paths
+sprig diff                                     # hunks are numbered: "@@ ... @@ hunk 2"
+sprig commit -m "one fix" --hunk main.go:2     # commit just that hunk
+sprig gc                                       # pack objects, deltas between versions
 ```
 
 ### Importing from git
@@ -99,7 +103,11 @@ The ref swap uses a file lock, so several `sprig serve` processes can share
 one repository directory (on one machine) and land concurrently.
 
 A cache server keeps its own copy of objects, which never change once written,
-and passes everything else (refs, landing, log) through to the main server:
+and passes most other requests (refs, log, files) through to the main server.
+It does landings itself: it reads the tip from the main server, merges using
+its own object copy, uploads only the objects the landing created, and sends
+one compare-and-swap of the ref. So caches on any number of machines can take
+landing load, and the main server only checks and moves refs:
 
 ```sh
 sprig init --bare cache.sprig
@@ -118,7 +126,8 @@ sprig clone --path services/api http://127.0.0.1:7700 work
 This downloads history and directory trees but no file contents. Only files
 under `--path` are written to disk; leave `--path` out to check out
 everything. Any file content sprig needs later (diff, merge, show) is
-downloaded on first use and kept. Files outside the view count as unchanged,
+downloaded on first use and kept. A merge conflict in a file outside the view
+adds that file to the view, so it can be resolved. Files outside the view count as unchanged,
 so `commit`, `land` and `push` work as usual.
 
 Change the view later with `sprig sparse <path>...`, or `sprig sparse .` to
@@ -152,6 +161,16 @@ SPRIG_TOKEN=admin-secret sprig serve --tokens tokens.json repo.sprig
 A scoped token can read everything but can only `land`, and only under its
 directories. Moving refs directly (`push`) is refused, because that could
 carry changes to any path. `SPRIG_TOKEN` stays full access.
+
+To limit reading too, give the token an object:
+
+```json
+{ "contractor-token-0123456789": { "write": ["services/api"], "read": ["services/api", "docs"] } }
+```
+
+Such a token can only read through `/v1/file` and `/v1/ls` (which hides
+everything outside its paths) and land. It gets no raw object access, since
+an object id says nothing about which path it belongs to.
 
 ### Pushing to GitHub (or any git host)
 
@@ -239,31 +258,37 @@ gitimport.go  git -> sprig converter (via `git cat-file --batch`)
 gitexport.go  sprig -> git converter (via `git fast-import`)
 batch.go      batched object transfer
 sign.go       ed25519 change signatures
+pack.go       packfiles, deltas, gc
+astmerge.go   Go-aware merge (go/parser)
 main.go       CLI
 ```
 
 ## Measured
 
 A synthetic git repo with 3,001 commits and 300 files imports in about 8s;
-afterwards `status` takes 8 ms and `log` 4 ms. With 3,000 files, `status` takes
-about 49 ms against git's 4 ms, because sprig re-reads every file (see below).
+afterwards `status` takes 8 ms and `log` 4 ms. With 3,000 files, `status`
+takes about 17 ms (49 ms before the stat cache); git takes about 1 ms.
+
+Storage, 300 Go files with 300 commits of small edits: git after `git gc`
+856 KB; sprig 2.8 MB of loose objects (10.7 MB on disk, one file each),
+1.0 MB after `sprig gc` (2,005 of 2,673 objects stored as deltas, in 1.4 s).
+Reading from packs stays fast: `status` 6 ms, `log -n 300` 17 ms.
 
 ## Not done (yet)
 
-- **No delta compression or packfiles.** Objects are stored individually and
-  zlib-compressed, so storage is about 2x git's on the same history.
-- **Line-based merge only.** The plan was AST-aware merge via tree-sitter;
-  this needs a cgo dependency, so it was left out of the prototype.
-- **Renames are exact-content only.** A file that was renamed and edited
-  shows as a delete plus an add.
-- **Servers must share a disk.** The ref lock is a Unix file lock, so
-  multiple servers need the same local filesystem. Machines on separate
-  disks would need a shared lock or database (Scion uses Spanner).
-- **Permissions restrict writes only.** Any valid token can read the whole
-  repository.
-- **Hidden conflicts in partial clones.** A merge conflict in a file outside
-  the view is recorded but not visible on disk; widen with `sprig sparse`.
-- **A fetch is held in memory** until it is complete.
-- **No stat cache.** `status` and `commit` read and hash every file each time,
-  so they slow down linearly with repository size.
-- **Commits are whole-file.** `commit <path>...` picks files, not hunks.
+- **Code-aware merge is Go only.** It uses the standard library's parser;
+  other languages would need tree-sitter, a cgo dependency.
+- **One authority holds the refs.** Caches on any machine do the landing
+  work, but every ref swap goes to a single main server (Scion keeps refs in
+  Spanner). That server's own lock is a Unix file lock.
+- **Read-scoped tokens can't clone.** Objects are fetched by id alone, so
+  these tokens are limited to `/file`, `/ls` and `land`. History metadata
+  (`/log`, `/changes`) is visible to every token.
+- **`status` is ~17 ms at 3,000 files, git ~1 ms.** The stat cache skips
+  reading files, but every file is still `lstat`-ed and the cache is a text
+  file rather than a memory-mapped index.
+- **Storage is ~1.2x git's after `gc`**, and loose objects (one file each)
+  accumulate until you run it. There is no automatic gc or repacking of old
+  packs into one.
+- **Renames use a simple line-overlap score** and only among up to 50
+  added x 50 deleted files.
