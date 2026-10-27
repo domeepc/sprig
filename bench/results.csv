@@ -1,89 +1,89 @@
 files,command,tool,ms
-1000,startup,git,1.230
-1000,startup,sprig,2.488
-1000,status,git,3.353
-1000,status,sprig,4.189
-1000,log -n 100,git,3.576
-1000,log -n 100,sprig,4.009
-1000,show HEAD~10,git,2.361
-1000,show HEAD~10,sprig,4.044
-1000,diff HEAD~50 HEAD,git,10.387
-1000,diff HEAD~50 HEAD,sprig,7.823
-1000,status (1 modified),git,3.272
-1000,status (1 modified),sprig,4.848
-1000,diff (working tree),git,2.600
-1000,diff (working tree),sprig,5.238
-1000,status (sprig watch),sprig,2.999
-1000,status (sprig watch),git,3.340
-1000,checkout (50 back),git,11.291
-1000,checkout (50 back),sprig,11.839
-1000,commit (1 file),git,6.261
-1000,commit (1 file),sprig,7.663
-1000,storage (KB),git,424
-1000,storage (KB),sprig,404
-3000,startup,git,1.198
-3000,startup,sprig,2.353
-3000,status,git,3.920
-3000,status,sprig,5.908
-3000,log -n 100,git,3.636
-3000,log -n 100,sprig,4.042
-3000,show HEAD~10,git,2.342
-3000,show HEAD~10,sprig,4.153
-3000,diff HEAD~50 HEAD,git,10.490
-3000,diff HEAD~50 HEAD,sprig,7.571
-3000,status (1 modified),git,3.986
-3000,status (1 modified),sprig,7.383
-3000,diff (working tree),git,2.663
-3000,diff (working tree),sprig,8.066
-3000,status (sprig watch),sprig,3.000
-3000,status (sprig watch),git,4.037
-3000,checkout (50 back),git,12.229
-3000,checkout (50 back),sprig,19.292
-3000,commit (1 file),git,9.312
-3000,commit (1 file),sprig,10.968
-3000,storage (KB),git,800
-3000,storage (KB),sprig,928
-10000,startup,git,1.190
-10000,startup,sprig,2.324
-10000,status,git,7.431
-10000,status,sprig,11.984
-10000,log -n 100,git,3.374
-10000,log -n 100,sprig,4.056
-10000,show HEAD~10,git,2.342
-10000,show HEAD~10,sprig,4.793
-10000,diff HEAD~50 HEAD,git,7.322
-10000,diff HEAD~50 HEAD,sprig,8.104
-10000,status (1 modified),git,7.872
-10000,status (1 modified),sprig,17.141
-10000,diff (working tree),git,4.276
-10000,diff (working tree),sprig,19.996
-10000,status (sprig watch),sprig,3.020
-10000,status (sprig watch),git,7.728
-10000,checkout (50 back),git,15.770
-10000,checkout (50 back),sprig,47.363
-10000,commit (1 file),git,11.323
-10000,commit (1 file),sprig,25.151
-10000,storage (KB),git,2120
-10000,storage (KB),sprig,2764
-30000,startup,git,1.184
-30000,startup,sprig,2.357
-30000,status,git,18.055
-30000,status,sprig,34.813
-30000,log -n 100,git,2.915
-30000,log -n 100,sprig,4.455
-30000,show HEAD~10,git,2.415
-30000,show HEAD~10,sprig,6.602
-30000,diff HEAD~50 HEAD,git,6.908
-30000,diff HEAD~50 HEAD,sprig,9.376
-30000,status (1 modified),git,18.007
-30000,status (1 modified),sprig,43.682
-30000,diff (working tree),git,9.663
-30000,diff (working tree),sprig,52.759
-30000,status (sprig watch),sprig,3.588
-30000,status (sprig watch),git,19.476
-30000,checkout (50 back),git,27.807
-30000,checkout (50 back),sprig,135.153
-30000,commit (1 file),git,21.600
-30000,commit (1 file),sprig,74.993
-30000,storage (KB),git,5936
-30000,storage (KB),sprig,8132
+1000,startup,git,2.268
+1000,startup,sprig,2.182
+1000,status,git,4.941
+1000,status,sprig,4.419
+1000,log -n 100,git,5.255
+1000,log -n 100,sprig,3.745
+1000,show HEAD~10,git,3.166
+1000,show HEAD~10,sprig,3.326
+1000,diff HEAD~50 HEAD,git,14.708
+1000,diff HEAD~50 HEAD,sprig,6.262
+1000,status (1 modified),git,5.870
+1000,status (1 modified),sprig,6.567
+1000,diff (working tree),git,4.216
+1000,diff (working tree),sprig,6.988
+1000,status (sprig watch),sprig,3.072
+1000,status (sprig watch),git,5.367
+1000,checkout (50 back),git,67.118
+1000,checkout (50 back),sprig,34.231
+1000,commit (1 file),git,14.093
+1000,commit (1 file),sprig,11.211
+1000,storage (KB),git,472
+1000,storage (KB),sprig,384
+3000,startup,git,2.227
+3000,startup,sprig,2.561
+3000,status,git,9.685
+3000,status,sprig,6.230
+3000,log -n 100,git,5.177
+3000,log -n 100,sprig,4.097
+3000,show HEAD~10,git,3.922
+3000,show HEAD~10,sprig,4.513
+3000,diff HEAD~50 HEAD,git,18.367
+3000,diff HEAD~50 HEAD,sprig,7.494
+3000,status (1 modified),git,7.549
+3000,status (1 modified),sprig,7.618
+3000,diff (working tree),git,7.062
+3000,diff (working tree),sprig,7.625
+3000,status (sprig watch),sprig,3.490
+3000,status (sprig watch),git,8.232
+3000,checkout (50 back),git,29.476
+3000,checkout (50 back),sprig,35.537
+3000,commit (1 file),git,16.160
+3000,commit (1 file),sprig,10.783
+3000,storage (KB),git,848
+3000,storage (KB),sprig,840
+10000,startup,git,2.883
+10000,startup,sprig,2.566
+10000,status,git,17.069
+10000,status,sprig,11.963
+10000,log -n 100,git,6.386
+10000,log -n 100,sprig,5.369
+10000,show HEAD~10,git,4.140
+10000,show HEAD~10,sprig,3.723
+10000,diff HEAD~50 HEAD,git,13.619
+10000,diff HEAD~50 HEAD,sprig,8.211
+10000,status (1 modified),git,17.156
+10000,status (1 modified),sprig,15.654
+10000,diff (working tree),git,9.786
+10000,diff (working tree),sprig,13.171
+10000,status (sprig watch),sprig,3.822
+10000,status (sprig watch),git,16.276
+10000,checkout (50 back),git,78.878
+10000,checkout (50 back),sprig,46.711
+10000,commit (1 file),git,26.700
+10000,commit (1 file),sprig,17.995
+10000,storage (KB),git,2168
+10000,storage (KB),sprig,2436
+30000,startup,git,2.193
+30000,startup,sprig,2.105
+30000,status,git,33.219
+30000,status,sprig,22.288
+30000,log -n 100,git,5.721
+30000,log -n 100,sprig,5.532
+30000,show HEAD~10,git,3.797
+30000,show HEAD~10,sprig,4.426
+30000,diff HEAD~50 HEAD,git,11.655
+30000,diff HEAD~50 HEAD,sprig,9.750
+30000,status (1 modified),git,38.153
+30000,status (1 modified),sprig,28.236
+30000,diff (working tree),git,20.702
+30000,diff (working tree),sprig,23.261
+30000,status (sprig watch),sprig,3.927
+30000,status (sprig watch),git,40.095
+30000,checkout (50 back),git,96.893
+30000,checkout (50 back),sprig,67.430
+30000,commit (1 file),git,51.780
+30000,commit (1 file),sprig,38.519
+30000,storage (KB),git,5924
+30000,storage (KB),sprig,7084

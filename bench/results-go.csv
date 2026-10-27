@@ -1,0 +1,45 @@
+files,command,tool,ms
+1000,startup,sprig,5.501
+1000,status,sprig,10.970
+1000,log -n 100,sprig,7.786
+1000,show HEAD~10,sprig,7.694
+1000,diff HEAD~50 HEAD,sprig,15.198
+1000,status (1 modified),sprig,13.566
+1000,diff (working tree),sprig,13.164
+1000,status (sprig watch),sprig,9.025
+1000,checkout (50 back),sprig,50.968
+1000,commit (1 file),sprig,20.560
+1000,storage (KB),sprig,424
+3000,startup,sprig,5.480
+3000,status,sprig,13.056
+3000,log -n 100,sprig,7.846
+3000,show HEAD~10,sprig,8.697
+3000,diff HEAD~50 HEAD,sprig,13.496
+3000,status (1 modified),sprig,16.786
+3000,diff (working tree),sprig,18.255
+3000,status (sprig watch),sprig,9.685
+3000,checkout (50 back),sprig,60.729
+3000,commit (1 file),sprig,31.660
+3000,storage (KB),sprig,948
+10000,startup,sprig,5.294
+10000,status,sprig,28.152
+10000,log -n 100,sprig,7.980
+10000,show HEAD~10,sprig,9.924
+10000,diff HEAD~50 HEAD,sprig,13.448
+10000,status (1 modified),sprig,38.071
+10000,diff (working tree),sprig,36.442
+10000,status (sprig watch),sprig,7.951
+10000,checkout (50 back),sprig,132.851
+10000,commit (1 file),sprig,63.012
+10000,storage (KB),sprig,2784
+30000,startup,sprig,6.225
+30000,status,sprig,82.790
+30000,log -n 100,sprig,9.896
+30000,show HEAD~10,sprig,13.084
+30000,diff HEAD~50 HEAD,sprig,17.944
+30000,status (1 modified),sprig,92.954
+30000,diff (working tree),sprig,130.614
+30000,status (sprig watch),sprig,9.606
+30000,checkout (50 back),sprig,369.912
+30000,commit (1 file),sprig,180.461
+30000,storage (KB),sprig,8152

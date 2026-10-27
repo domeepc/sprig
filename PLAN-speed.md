@@ -1,6 +1,25 @@
 # Plan: status, diff, commit and checkout as fast as git on large repos
 
-## Where we are
+## Status: done in the Rust rewrite
+
+All four phases are implemented (`src/index.rs`, `src/merge.rs`,
+`src/pack.rs`), with the tests listed under Verification in `tests/`. One
+step was left out: directory mtimes (Phase 1, step 4) to skip `getdents`;
+reading a directory costs a few syscalls per 100 files, so it was not worth
+the extra state. Results at 30k files on a 4-core VM (ms, git / Rust sprig /
+Go sprig, from `bench/results.csv` and `bench/results-go.csv`):
+
+| Command | git | Rust | Go |
+|---|---|---|---|
+| `status` (clean) | 33.2 | 22.3 | 82.8 |
+| `diff` (working tree) | 20.7 | 23.3 | 130.6 |
+| `commit` (1 file) | 51.8 | 38.5 | 180.5 |
+| `checkout` (50 back) | 96.9 | 67.4 | 369.9 |
+
+Startup is now on par with git (~2 ms). The rest of this file is the plan as
+written for the Go version.
+
+## Where we were
 
 From `bench/run.sh` (100 commits, ms, average of 20 runs):
 
