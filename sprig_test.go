@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -59,6 +60,7 @@ func newRepo(t *testing.T) string {
 	t.Setenv("SPRIG_AUTHOR", "Test <test@example.com>")
 	t.Setenv("SPRIG_AGENT", "")
 	t.Setenv("SPRIG_MODEL", "")
+	t.Setenv("SPRIG_KEY", filepath.Join(dir, "no-key")) // never sign with the developer's real key
 	must(t, "init")
 	return dir
 }
@@ -627,7 +629,9 @@ func TestExportGitRoundTrip(t *testing.T) {
 			t.Fatalf("message lacks %q:\n%s", want, msg)
 		}
 	}
-	must(t, "export-git", clone)
+	if out := must(t, "export-git", clone); !strings.Contains(out, "wrote 0 commit(s)") {
+		t.Fatalf("re-export rewrote known commits: %s", out)
+	}
 	if again := git(t, clone, "rev-parse", "main"); again != tip {
 		t.Fatal("re-export changed the commit (should be deterministic)")
 	}
@@ -923,5 +927,215 @@ func TestLazySparseClone(t *testing.T) {
 	tip, _ = repo.ReadRef("heads/main")
 	if flat, _ := repo.ChangeFlat(tip); flat["a.txt"].ID == "" || flat["d/y.txt"].ID == "" {
 		t.Fatalf("push from sparse clone lost files: %v", flat)
+	}
+}
+
+func TestImportGitDiverged(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	g := t.TempDir()
+	git(t, g, "init", "-q", "-b", "main")
+	write(t, filepath.Join(g, "a.txt"), "1\n2\n")
+	git(t, g, "add", ".")
+	git(t, g, "commit", "-q", "-m", "seed")
+	newRepo(t)
+	must(t, "import-git", g)
+	write(t, "b.txt", "sprig side\n")
+	must(t, "commit", "-m", "sprig work")
+	write(t, filepath.Join(g, "a.txt"), "1\n2\ngit side\n")
+	git(t, g, "commit", "-q", "-am", "git work")
+	if out := must(t, "import-git", g); !strings.Contains(out, "git/main") {
+		t.Fatalf("diverged branch not kept: %s", out)
+	}
+	must(t, "merge", "git/main")
+	if read(t, "a.txt") != "1\n2\ngit side\n" || read(t, "b.txt") != "sprig side\n" {
+		t.Fatal("merging the diverged git branch lost a side")
+	}
+	write(t, "c.txt", "more\n")
+	must(t, "commit", "-m", "ahead of git")
+	if out := must(t, "import-git", g); strings.Contains(out, "warning") {
+		t.Fatalf("branch that is only ahead of git reported as diverged: %s", out)
+	}
+}
+
+func TestRenames(t *testing.T) {
+	newRepo(t)
+	write(t, "old.txt", "same content\n")
+	must(t, "commit", "-m", "one")
+	os.Rename("old.txt", "new.txt")
+	if out := must(t, "status"); !strings.Contains(out, "R old.txt -> new.txt") {
+		t.Fatalf("status: %s", out)
+	}
+	must(t, "commit", "-m", "rename")
+	if out := must(t, "show"); !strings.Contains(out, "renamed: old.txt -> new.txt") {
+		t.Fatalf("show: %s", out)
+	}
+}
+
+func TestCrissCrossMerge(t *testing.T) {
+	newRepo(t)
+	write(t, "f", "1\n2\n3\n")
+	must(t, "commit", "-m", "base")
+	must(t, "checkout", "-b", "y")
+	write(t, "f", "1\n2\ny\n")
+	must(t, "commit", "-m", "y1")
+	must(t, "checkout", "main")
+	write(t, "f", "x\n2\n3\n")
+	must(t, "commit", "-m", "x1")
+	x1, _ := FindRepo()
+	_, x1id := x1.Head()
+	must(t, "merge", "--no-ff", "y") // main: x,2,y
+	must(t, "checkout", "y")
+	must(t, "merge", "--no-ff", x1id) // y: x,2,y, via the other parent order
+	write(t, "f", "x\n2\nyy\n")
+	must(t, "commit", "-m", "y3")
+	must(t, "checkout", "main")
+	write(t, "f", "xx\n2\ny\n")
+	must(t, "commit", "-m", "x3")
+	// either single base conflicts here; the merged virtual base does not
+	if out, err := sp(t, "merge", "y"); err != nil {
+		t.Fatalf("criss-cross merge conflicted: %v\n%s", err, out)
+	}
+	if got := read(t, "f"); got != "xx\n2\nyy\n" {
+		t.Fatalf("merged f = %q", got)
+	}
+}
+
+func TestSparseWiden(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, _ := seedServer(t, NewServer(srv, ""))
+	t.Chdir(t.TempDir())
+	must(t, "clone", "--path", "d", url, "w")
+	t.Chdir("w")
+	must(t, "sparse", ".")
+	if read(t, "a.txt") != "a\n" {
+		t.Fatal("widening did not check out a.txt")
+	}
+	must(t, "sparse", "d")
+	if _, err := os.Stat("a.txt"); err == nil {
+		t.Fatal("narrowing did not remove a.txt")
+	}
+	if out := must(t, "status"); !strings.Contains(out, "clean") {
+		t.Fatalf("status after narrowing: %s", out)
+	}
+}
+
+func TestBatchedTransfer(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	var single, batch int
+	h := NewServer(srv, "").Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasPrefix(req.URL.Path, "/v1/object/"):
+			single++
+		case strings.HasPrefix(req.URL.Path, "/v1/objects/get"), strings.HasPrefix(req.URL.Path, "/v1/objects/put"):
+			batch++
+		}
+		h.ServeHTTP(w, req)
+	}))
+	defer ts.Close()
+	newRepo(t)
+	must(t, "remote", "add", "origin", ts.URL)
+	for i := range 60 {
+		write(t, fmt.Sprintf("d%d/f%d.txt", i%5, i), fmt.Sprint(i))
+	}
+	must(t, "commit", "-m", "many")
+	must(t, "push")
+	b := t.TempDir()
+	t.Chdir(b)
+	must(t, "init")
+	must(t, "remote", "add", "origin", ts.URL)
+	must(t, "pull")
+	if read(t, "d3/f8.txt") != "8" {
+		t.Fatal("pull incomplete")
+	}
+	if single != 0 || batch > 5 { // 1 put + one get per tree level
+		t.Fatalf("requests: %d single, %d batched", single, batch)
+	}
+}
+
+func TestSignedChanges(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	url, repo := seedServer(t, NewServer(srv, ""))
+	out := must(t, "keygen")
+	pub := strings.Fields(out[strings.Index(out, "public key: "):])[2]
+	must(t, "trust", pub, "me")
+	write(t, "a.txt", "signed\n")
+	t.Setenv("SPRIG_AGENT", "claude")
+	must(t, "commit", "-m", "signed commit", "--check", "review=approved")
+	if out := must(t, "show"); !strings.Contains(out, "Signed: me (trusted)") {
+		t.Fatalf("show: %s", out)
+	}
+	must(t, "audit", "--signed")
+
+	// a signed landing verifies on the server's change
+	write(t, "d/x.txt", "landed\n")
+	must(t, "push")
+	write(t, "d/x.txt", "landed again\n")
+	must(t, "land", "-m", "signed land", "--check", "review=approved")
+	tip, _ := repo.ReadRef("heads/main")
+	c, _ := repo.GetChange(tip)
+	if key, err := repo.VerifyChange(c); err != nil || key != pub {
+		t.Fatalf("landed change: key %q err %v", key, err)
+	}
+	must(t, "audit", "--signed")
+
+	// tampering is caught: same signature, different message or extra path
+	forged := *c
+	forged.Message = "not what was signed"
+	if _, err := repo.VerifyChange(&forged); err == nil {
+		t.Fatal("altered message verified")
+	}
+	flat, _ := repo.Flatten(c.Tree)
+	flat["sneaky.txt"] = flat["a.txt"]
+	forged = *c
+	forged.Tree, _ = repo.BuildTree(flat)
+	if _, err := repo.VerifyChange(&forged); err == nil || !strings.Contains(err.Error(), "unsigned path") {
+		t.Fatalf("extra path verified: %v", err)
+	}
+	// unsigned agent change fails audit --signed
+	os.Setenv("SPRIG_KEY", filepath.Join(t.TempDir(), "none"))
+	write(t, "a.txt", "unsigned\n")
+	must(t, "commit", "-m", "unsigned", "--check", "review=approved")
+	if out, err := sp(t, "audit", "--signed"); err == nil || !strings.Contains(out, "unsigned") {
+		t.Fatalf("unsigned change passed audit: %v %s", err, out)
+	}
+	_ = url
+}
+
+func TestCommitPaths(t *testing.T) {
+	newRepo(t)
+	write(t, "a.txt", "a\n")
+	write(t, "d/b.txt", "b\n")
+	must(t, "commit", "-m", "only d", "d")
+	r, _ := FindRepo()
+	_, head := r.Head()
+	if flat, _ := r.ChangeFlat(head); len(flat) != 1 || flat["d/b.txt"].ID == "" {
+		t.Fatalf("path commit took %v", flat)
+	}
+	os.Remove("d/b.txt")
+	write(t, "a.txt", "a2\n")
+	must(t, "commit", "-m", "drop b", "d/b.txt")
+	_, head = r.Head()
+	if flat, _ := r.ChangeFlat(head); len(flat) != 0 {
+		t.Fatalf("deletion not committed alone: %v", flat)
+	}
+	if out := must(t, "status"); !strings.Contains(out, "A a.txt") {
+		t.Fatalf("a.txt should still be uncommitted: %s", out)
+	}
+}
+
+func TestCheckoutNewBranchKeepsWork(t *testing.T) {
+	newRepo(t)
+	write(t, "a.txt", "a\n")
+	must(t, "commit", "-m", "one")
+	write(t, "a.txt", "edited\n")
+	must(t, "checkout", "-b", "topic")
+	if read(t, "a.txt") != "edited\n" {
+		t.Fatal("uncommitted edit lost")
+	}
+	if out := must(t, "status"); !strings.Contains(out, "On branch topic") || !strings.Contains(out, "M a.txt") {
+		t.Fatalf("status: %s", out)
 	}
 }
