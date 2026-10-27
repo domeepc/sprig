@@ -863,11 +863,17 @@ func TestScopedTokens(t *testing.T) {
 		t.Fatalf("ls not filtered: %s %v", data, err)
 	}
 	refs, _ := ro.Refs()
-	if _, _, err := ro.GetObject(refs["heads/main"]); err == nil {
-		t.Fatal("read-limited token fetched a raw object")
+	if _, _, err := ro.GetObject(refs["heads/main"]); err != nil {
+		t.Fatalf("projected tip not fetchable: %v", err)
 	}
-	if err := ro.GetObjects([]string{refs["heads/main"]}, func(string, object) error { return nil }); err == nil {
-		t.Fatal("read-limited token used batch fetch")
+	realTip, _ := s.repo.ReadRef("heads/main")
+	for _, id := range []string{realTip, HashObject(TypeBlob, []byte("a\n"))} {
+		if _, _, err := ro.GetObject(id); err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("read-limited token fetched out-of-scope object %s: %v", short(id), err)
+		}
+		if err := ro.GetObjects([]string{id}, func(string, object) error { return nil }); err == nil {
+			t.Fatal("read-limited token batch-fetched an out-of-scope object")
+		}
 	}
 	if err := land(t, url, "read-d-only-token-12", map[string]*LandFile{"d/x.txt": f}); err == nil {
 		t.Fatal("read-only token landed")
@@ -1807,5 +1813,58 @@ func TestTreeSitterMerge(t *testing.T) {
 	// unknown language: no structural merge
 	if _, ok := codeMerge("x.txt", []byte("a\n"), []byte("b\n"), []byte("c\n")); ok {
 		t.Error("plain text was merged structurally")
+	}
+}
+
+func TestProjectedClone(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	s := NewServer(srv, "full-access-token")
+	s.scopes = map[string]Scope{"api-team-token-1234": {Read: []string{"api"}, Write: []string{"api"}}}
+	t.Setenv("SPRIG_TOKEN", "full-access-token")
+	url, repo := seedServer(t, s)
+	write(t, "api/h.go", "package api\n")
+	must(t, "commit", "-m", "add api")
+	write(t, "secret/plan.txt", "do not leak\n")
+	must(t, "commit", "-m", "secret project codename")
+	write(t, "api/h.go", "package api\n// v2\n")
+	must(t, "commit", "-m", "api v2")
+	must(t, "push")
+
+	t.Setenv("SPRIG_TOKEN", "api-team-token-1234")
+	t.Chdir(t.TempDir())
+	must(t, "clone", url, "w")
+	t.Chdir("w")
+	if read(t, "api/h.go") != "package api\n// v2\n" {
+		t.Fatal("projected clone lacks the api files")
+	}
+	for _, p := range []string{"a.txt", "secret/plan.txt", "d/x.txt"} {
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("out-of-scope %s was cloned", p)
+		}
+	}
+	log := must(t, "log", "-n", "20")
+	if strings.Contains(log, "secret project") || strings.Contains(log, "seed") || strings.Count(log, "change ") != 2 {
+		t.Fatalf("projected history should hold only the two api changes:\n%s", log)
+	}
+	if out := must(t, "show"); !strings.Contains(out, "Projected from") {
+		t.Fatalf("projected change not marked: %s", out)
+	}
+	// land from the projected clone; the real repo gets it on top of everything
+	write(t, "api/h.go", "package api\n// v3\n")
+	must(t, "land", "-m", "api v3")
+	tip, _ := repo.ReadRef("heads/main")
+	real, _ := repo.ChangeFlat(tip)
+	if b, _ := repo.GetBlob(real["api/h.go"].ID); string(b) != "package api\n// v3\n" || real["secret/plan.txt"].ID == "" {
+		t.Fatalf("landing from a projection broke the real tree: %v", real)
+	}
+	if out := must(t, "status"); !strings.Contains(out, "clean") {
+		t.Fatalf("projected clone not clean after land: %s", out)
+	}
+	// and the projection is persisted: a fresh server process gives the same ids
+	refs1, _ := newRemote("t", url).Refs()
+	projections.Range(func(k, _ any) bool { projections.Delete(k); return true })
+	refs2, _ := newRemote("t", url).Refs()
+	if refs1["heads/main"] != refs2["heads/main"] || refs1["heads/main"] == "" {
+		t.Fatalf("projection changed after reload: %v vs %v", refs1, refs2)
 	}
 }
