@@ -4,7 +4,9 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -191,6 +193,77 @@ func mergeMode(base FileEnt, haveBase bool, o, t FileEnt) string {
 	default:
 		return o.Mode
 	}
+}
+
+// alignRenames prepares a three-way merge for renames: when one side renamed
+// a file, the base and the other side's version move to the new path too, so
+// an edit on one side and a rename on the other merge into the renamed file
+// instead of conflicting as delete-vs-modify. Files the other side added to a
+// directory that this side moved wholesale follow it. A file renamed on both
+// sides is left alone. The inputs are not modified.
+func (r *Repo) alignRenames(base, ours, theirs Flat) (Flat, Flat, Flat) {
+	ro, rt := r.renames(base, ours), r.renames(base, theirs)
+	if len(ro) == 0 && len(rt) == 0 {
+		return base, ours, theirs
+	}
+	b, o, t := maps.Clone(base), maps.Clone(ours), maps.Clone(theirs)
+	move := func(side Flat, from, to string) {
+		if fe, ok := side[from]; ok {
+			if _, taken := side[to]; !taken {
+				side[to] = fe
+				delete(side, from)
+			}
+		}
+	}
+	for old, nw := range ro {
+		if _, both := rt[old]; !both {
+			move(t, old, nw)
+			move(b, old, nw)
+		}
+	}
+	for old, nw := range rt {
+		if _, both := ro[old]; !both {
+			move(o, old, nw)
+			move(b, old, nw)
+		}
+	}
+	follow := func(ren map[string]string, side Flat) {
+		dirs := dirRenames(base, ren)
+		var add []string
+		for p := range side {
+			if _, inBase := base[p]; !inBase && dirs[path.Dir(p)] != "" {
+				add = append(add, p)
+			}
+		}
+		for _, p := range add {
+			move(side, p, dirs[path.Dir(p)]+"/"+path.Base(p))
+		}
+	}
+	follow(ro, t)
+	follow(rt, o)
+	return b, o, t
+}
+
+// dirRenames finds directories whose files all moved, under the same names,
+// into one other directory.
+func dirRenames(base Flat, ren map[string]string) map[string]string {
+	files := map[string]int{}
+	for p := range base {
+		files[path.Dir(p)]++
+	}
+	moves := map[[2]string]int{}
+	for old, nw := range ren {
+		if path.Base(old) == path.Base(nw) && path.Dir(old) != path.Dir(nw) {
+			moves[[2]string{path.Dir(old), path.Dir(nw)}]++
+		}
+	}
+	out := map[string]string{}
+	for m, n := range moves {
+		if n == files[m[0]] {
+			out[m[0]] = m[1]
+		}
+	}
+	return out
 }
 
 // MergeFlat three-way merges two flat trees against their base. Files that
@@ -511,7 +584,8 @@ func (r *Repo) Merge(targetRev string, noFF bool, msg string, meta Meta) (*Merge
 	if ref != "" {
 		oursLabel = strings.TrimPrefix(ref, "heads/")
 	}
-	merged, conflicts, err := r.MergeFlat(baseFlat, curFlat, theirFlat, oursLabel, targetRev)
+	mb, mo, mt := r.alignRenames(baseFlat, curFlat, theirFlat)
+	merged, conflicts, err := r.MergeFlat(mb, mo, mt, oursLabel, targetRev)
 	if err != nil {
 		return nil, err
 	}
