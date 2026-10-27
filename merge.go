@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -307,6 +308,7 @@ type CommitOpts struct {
 	Message    string
 	Meta       Meta
 	AllowEmpty bool
+	Paths      []string // if set, only these files/directories are committed; the rest stays as in HEAD
 }
 
 func (r *Repo) authorString() string {
@@ -316,7 +318,7 @@ func (r *Repo) authorString() string {
 
 func (r *Repo) newChange(parents []string, tree string, msg string, meta Meta, conflicts []Conflict) *Change {
 	now := time.Now()
-	return &Change{
+	c := &Change{
 		Parents:   parents,
 		Tree:      tree,
 		Author:    r.authorString(),
@@ -326,6 +328,12 @@ func (r *Repo) newChange(parents []string, tree string, msg string, meta Meta, c
 		Meta:      meta,
 		Conflicts: conflicts,
 	}
+	if key, err := signingKey(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: change not signed: %v\n", err)
+	} else if key != nil {
+		c.Sig = sign(key, changePayload(c))
+	}
+	return c
 }
 
 var errNothingToCommit = errors.New("nothing to commit")
@@ -345,6 +353,23 @@ func (r *Repo) Commit(o CommitOpts) (string, error) {
 	flat, err := r.Snapshot(true)
 	if err != nil {
 		return "", err
+	}
+	if len(o.Paths) > 0 {
+		hf, err := r.ChangeFlat(head)
+		if err != nil {
+			return "", err
+		}
+		only := Config{Sparse: o.Paths} // reuse the prefix matching of sparse views
+		for p := range flat {
+			if !only.inView(p) {
+				delete(flat, p)
+			}
+		}
+		for p, fe := range hf {
+			if !only.inView(p) {
+				flat[p] = fe
+			}
+		}
 	}
 	tree, err := r.BuildTree(flat)
 	if err != nil {
@@ -498,6 +523,14 @@ func (r *Repo) Checkout(rev string, force, create bool, start string) error {
 		} else if targetID, err = r.ResolveRev(rev); err != nil {
 			return err
 		}
+	}
+	if create && targetID == cur {
+		// a new branch at the current change: nothing on disk moves, so
+		// uncommitted work simply comes along
+		if err := r.WriteRef(headRef, targetID); err != nil {
+			return err
+		}
+		return r.SetHeadRef(headRef)
 	}
 	targetFlat, err := r.ChangeFlat(targetID)
 	if err != nil {
