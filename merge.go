@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -35,6 +36,10 @@ func (r *Repo) Ancestors(id string) (map[string]int, error) {
 
 func (r *Repo) IsAncestor(anc, desc string) (bool, error) {
 	if anc == desc {
+		return true, nil
+	}
+	// the common case for pushes and landings: anc is a direct parent
+	if c, err := r.GetChange(desc); err == nil && slices.Contains(c.Parents, anc) {
 		return true, nil
 	}
 	set, err := r.Ancestors(desc)
@@ -290,6 +295,12 @@ func (r *Repo) mergeContent(p string, b FileEnt, hasB bool, o, t FileEnt, mode, 
 		return FileEnt{o.Mode, o.ID}, cf, nil
 	}
 	res := Merge3(splitLines(bd), splitLines(od), splitLines(td), oursLabel, theirsLabel)
+	if res.Conflicts > 0 && strings.HasSuffix(p, ".go") {
+		if merged, ok := goMerge(bd, od, td); ok {
+			id, err := r.PutBlob(merged)
+			return FileEnt{mode, id}, nil, err
+		}
+	}
 	id, err := r.PutBlob([]byte(strings.Join(res.Lines, "")))
 	if err != nil {
 		return FileEnt{}, nil, err
@@ -308,7 +319,8 @@ type CommitOpts struct {
 	Message    string
 	Meta       Meta
 	AllowEmpty bool
-	Paths      []string // if set, only these files/directories are committed; the rest stays as in HEAD
+	Paths      []string         // if set, only these files/directories are committed; the rest stays as in HEAD
+	Hunks      map[string][]int // path -> hunk numbers (as `diff` prints them) to commit from that file
 }
 
 func (r *Repo) authorString() string {
@@ -354,21 +366,52 @@ func (r *Repo) Commit(o CommitOpts) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(o.Paths) > 0 {
+	if len(o.Paths) > 0 || len(o.Hunks) > 0 {
 		hf, err := r.ChangeFlat(head)
 		if err != nil {
 			return "", err
 		}
 		only := Config{Sparse: o.Paths} // reuse the prefix matching of sparse views
-		for p := range flat {
-			if !only.inView(p) {
-				delete(flat, p)
-			}
-		}
+		picked := func(p string) bool { return len(o.Paths) > 0 && only.inView(p) }
+		work := flat
+		flat = Flat{}
 		for p, fe := range hf {
-			if !only.inView(p) {
+			if !picked(p) {
 				flat[p] = fe
 			}
+		}
+		for p, fe := range work {
+			if picked(p) {
+				flat[p] = fe
+			}
+		}
+		for p, nums := range o.Hunks {
+			var old, cur []byte
+			mode := work[p].Mode
+			if fe, ok := hf[p]; ok {
+				if old, err = r.GetBlob(fe.ID); err != nil {
+					return "", err
+				}
+				mode = fe.Mode
+			}
+			if fe, ok := work[p]; ok {
+				if cur, err = r.GetBlob(fe.ID); err != nil {
+					return "", err
+				}
+			}
+			keep := map[int]bool{}
+			for _, n := range nums {
+				keep[n] = true
+			}
+			lines, err := applyHunks(splitLines(old), splitLines(cur), keep)
+			if err != nil {
+				return "", fmt.Errorf("%s: %w", p, err)
+			}
+			id, err := r.PutBlob([]byte(strings.Join(lines, "")))
+			if err != nil {
+				return "", err
+			}
+			flat[p] = FileEnt{mode, id}
 		}
 	}
 	tree, err := r.BuildTree(flat)
@@ -482,6 +525,18 @@ func (r *Repo) Merge(targetRev string, noFF bool, msg string, meta Meta) (*Merge
 	id, err := r.PutChange(r.newChange([]string{cur, target}, tree, msg, meta, conflicts))
 	if err != nil {
 		return nil, err
+	}
+	// In a sparse checkout, conflicted files must be on disk to be resolved,
+	// so they join the view.
+	if cfg := r.LoadConfig(); len(cfg.Sparse) > 0 {
+		for _, cf := range conflicts {
+			if !cfg.inView(cf.Path) {
+				cfg.Sparse = append(cfg.Sparse, cf.Path)
+			}
+		}
+		if err := r.SaveConfig(cfg); err != nil {
+			return nil, err
+		}
 	}
 	if err := r.Materialize(curFlat, merged); err != nil {
 		return nil, err
