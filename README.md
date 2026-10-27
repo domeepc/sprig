@@ -5,9 +5,10 @@ from agents. It is a hybrid: the storage is content-addressed and
 distributed like git, and a server exposes the repository as an API so
 always-online tools can ask questions without cloning.
 
-Prototype, about 7,000 lines of Go plus 1,400 of tests. The only dependency
-outside the standard library is `fsnotify` (for `sprig watch`). It needs
-`git` on the PATH only for `import-git`/`export-git`.
+Prototype, about 7,300 lines of Go plus 1,500 of tests. Dependencies outside
+the standard library: `fsnotify` (for `sprig watch`) and `klauspost/compress`
+(zstd, for packs). It needs `git` on the PATH only for
+`import-git`/`export-git`.
 
 ```
 go build -o sprig .
@@ -50,7 +51,7 @@ sprig audit --require review # agent-authored changes without a passing review
 sprig commit -m "docs only" README.md docs/   # commit just these paths
 sprig diff                                     # hunks are numbered: "@@ ... @@ hunk 2"
 sprig commit -m "one fix" --hunk main.go:2     # commit just that hunk
-sprig gc                                       # pack objects, deltas between versions
+sprig gc [--repack]                            # pack objects, deltas between versions
 sprig watch &                                  # optional: status re-checks only changed files
 ```
 
@@ -238,6 +239,18 @@ API (all paths under `/v1`, bearer token when configured):
 A record is `<id> <type> <len>\n` followed by `<len>` bytes; every object is
 hash-checked on arrival.
 
+### Storage and gc
+
+New objects are written loose, one zlib file each. `sprig gc` moves them into
+a pack: each file and directory version is stored as a delta against its
+previous version (line-based or byte-level, whichever is smaller), trees in a
+compact binary form, everything zstd-compressed, and the result is read back
+and hash-checked before any loose copy is deleted. Once more than 8 packs
+exist, or with `--repack`, gc merges them into one. Commands that add objects
+(commit, merge, land, fetch, server uploads) start `sprig gc --auto` in the
+background when about 6,400 loose objects have piled up; `gc.lock` keeps runs
+from overlapping. Set `SPRIG_NO_AUTOGC=1` to turn that off.
+
 ### Faster status with `sprig watch`
 
 `status` and `commit` normally `lstat` every file (in parallel) and only read
@@ -257,6 +270,7 @@ overflow, `.sprigignore` changed), sprig falls back to the full walk. Set
 | `SPRIG_TOKEN` | bearer token for `serve` and for clients; a cache uses it to reach upstream |
 | `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
 | `SPRIG_NO_WATCH` | ignore a running `sprig watch` and walk the whole tree |
+| `SPRIG_NO_AUTOGC` | never start a background `gc --auto` |
 
 ## Layout
 
@@ -270,7 +284,7 @@ gitimport.go  git -> sprig converter (via `git cat-file --batch`)
 gitexport.go  sprig -> git converter (via `git fast-import`)
 batch.go      batched object transfer
 sign.go       ed25519 change signatures
-pack.go       packfiles, deltas, gc
+pack.go       packfiles (zstd, compact trees, deltas), gc, auto gc
 astmerge.go   Go-aware merge (go/parser)
 watch.go      `sprig watch` file watcher (fsnotify)
 main.go       CLI
@@ -285,9 +299,9 @@ walk), or 5.3 ms with `sprig watch` running; git takes about 1.5 ms. Starting
 the sprig process alone takes about 2.3 ms of that.
 
 Storage, 300 Go files with 300 commits of small edits: git after `git gc`
-856 KB; sprig 2.8 MB of loose objects (10.7 MB on disk, one file each),
-1.0 MB after `sprig gc` (2,005 of 2,673 objects stored as deltas, in 1.4 s).
-Reading from packs stays fast: `status` 6 ms, `log -n 300` 17 ms.
+847 KB; sprig 2.8 MB of loose objects (10.7 MB on disk, one file each),
+807 KB after `sprig gc` (2,005 of 2,673 objects stored as deltas, in 1.4 s).
+Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
 
 ## Not done (yet)
 
@@ -303,8 +317,8 @@ Reading from packs stays fast: `status` 6 ms, `log -n 300` 17 ms.
   startup (~2.3 ms) and building in-memory maps of every file; a
   memory-mapped index that status could compare without maps would close
   more of it.
-- **Storage is ~1.2x git's after `gc`**, and loose objects (one file each)
-  accumulate until you run it. There is no automatic gc or repacking of old
-  packs into one.
+- **Loose objects use a file each** until gc runs. Auto gc starts at about
+  6,400 of them (estimated, as git does), so a busy server holds up to that
+  many loose files between runs.
 - **Renames use a simple line-overlap score** and only among up to 50
   added x 50 deleted files.
