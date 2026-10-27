@@ -3,6 +3,7 @@ package main
 import (
 	"path"
 	"strings"
+	"sync"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	java "github.com/tree-sitter/tree-sitter-java/bindings/go"
@@ -30,7 +31,7 @@ type codeLang struct {
 	gap      string                                  // default separator between top-level units
 }
 
-var codeLangs = func() map[string]*codeLang {
+var codeLangs = sync.OnceValue(func() map[string]*codeLang {
 	py := &codeLang{sitter.NewLanguage(python.Language()), set("comment"), pyKey, pyBody, "\n\n\n"}
 	js := &codeLang{sitter.NewLanguage(javascript.Language()), set("comment"), jsKey, jsBody, "\n\n"}
 	ts := &codeLang{sitter.NewLanguage(typescript.LanguageTypescript()), set("comment"), jsKey, jsBody, "\n\n"}
@@ -39,7 +40,7 @@ var codeLangs = func() map[string]*codeLang {
 	jv := &codeLang{sitter.NewLanguage(java.Language()), set("line_comment", "block_comment"), javaKey, javaBody, "\n\n"}
 	return map[string]*codeLang{".py": py, ".js": js, ".mjs": js, ".cjs": js, ".jsx": js,
 		".ts": ts, ".mts": ts, ".cts": ts, ".tsx": tsx, ".rs": rs, ".java": jv}
-}()
+})
 
 func set(kinds ...string) map[string]bool {
 	m := map[string]bool{}
@@ -429,7 +430,7 @@ func (l *codeLang) mergeContainer(b, o, t string, depth int) (string, bool) {
 
 // treeSitterMerge merges a file in a supported language, or reports false.
 func treeSitterMerge(p string, base, ours, theirs []byte) ([]byte, bool) {
-	l := codeLangs[strings.ToLower(path.Ext(p))]
+	l := codeLangs()[strings.ToLower(path.Ext(p))]
 	if l == nil {
 		return nil, false
 	}
