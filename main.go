@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -49,7 +50,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
 
   init [--bare] [-b branch] [dir]     create a repository
   clone [-b branch] [--path dir]... <url> <dir>   lazy (and optionally sparse) working copy
-  commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]... [path...]
+  commit -m msg [--intent s] [--agent s] [--model s] [--check k=v]... [--hunk path:N]... [path...]
   status [--json]                     working tree vs HEAD, pending conflicts
   log [-n N] [--agent A] [--json] [rev]
   show [rev]                          a change and its diff
@@ -72,6 +73,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   import-git [--force] <git-repo>     convert a git repository's branches
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
+  gc                                  pack loose objects, with deltas between file versions
   sparse [path... | .]                 show or change which paths are checked out (. = all)
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
@@ -185,6 +187,16 @@ func run(cmd string, args []string) error {
 		return cmdSparse(r, args)
 	case "trust":
 		return cmdTrust(r, args)
+	case "gc":
+		res, err := r.GC()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "packed %d objects (%d as deltas): %d KB -> %d KB\n", res.Packed, res.Deltas, res.Before/1024, res.After/1024)
+		if res.DeletedLooseErr > 0 {
+			fmt.Fprintf(stdout, "warning: %d loose objects could not be removed (they are packed too)\n", res.DeletedLooseErr)
+		}
+		return nil
 	}
 	usage()
 	return &exitError{2, fmt.Sprintf("unknown command %q", cmd)}
@@ -304,6 +316,8 @@ func cmdCommit(r *Repo, args []string) error {
 	fs := newFlags("commit")
 	msg := fs.String("m", "", "message")
 	empty := fs.Bool("allow-empty", false, "allow a change with no file differences")
+	var hunkFlags multiFlag
+	fs.Var(&hunkFlags, "hunk", "commit only hunk N of a file, as path:N (repeatable; numbers as `sprig diff` shows)")
 	getMeta := metaFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -325,7 +339,20 @@ func cmdCommit(r *Repo, args []string) error {
 			}
 			paths = append(paths, p)
 		}
-		id, err = r.Commit(CommitOpts{Message: *msg, Meta: meta, AllowEmpty: *empty, Paths: paths})
+		hunks := map[string][]int{}
+		for _, h := range hunkFlags {
+			i := strings.LastIndex(h, ":")
+			n, err := strconv.Atoi(h[i+1:])
+			if i <= 0 || err != nil {
+				return fmt.Errorf("bad --hunk %q (want path:N)", h)
+			}
+			p := strings.Trim(filepath.ToSlash(h[:i]), "/")
+			if !validPath(p) {
+				return fmt.Errorf("bad path %q", p)
+			}
+			hunks[p] = append(hunks[p], n)
+		}
+		id, err = r.Commit(CommitOpts{Message: *msg, Meta: meta, AllowEmpty: *empty, Paths: paths, Hunks: hunks})
 		return err
 	})
 	if errors.Is(err, errNothingToCommit) {
@@ -362,7 +389,7 @@ func cmdStatus(r *Repo, args []string) error {
 	if err != nil {
 		return err
 	}
-	deltas = withRenames(deltas)
+	deltas = r.withRenames(deltas)
 	var conflicts []Conflict
 	if head != "" {
 		c, err := r.GetChange(head)
@@ -412,7 +439,11 @@ func cmdStatus(r *Repo, args []string) error {
 	fmt.Fprintln(stdout, "\nchanges since last change:")
 	for _, d := range deltas {
 		if d.Kind == "R" {
-			fmt.Fprintf(stdout, "  R %s -> %s\n", d.From, d.Path)
+			edited := ""
+			if d.Old.ID != d.New.ID {
+				edited = " (edited)"
+			}
+			fmt.Fprintf(stdout, "  R %s -> %s%s\n", d.From, d.Path, edited)
 			continue
 		}
 		fmt.Fprintf(stdout, "  %s %s\n", d.Kind, d.Path)
@@ -516,13 +547,15 @@ func cmdLog(r *Repo, args []string) error {
 func (r *Repo) diffBetween(a, b Flat) (string, error) {
 	var sb strings.Builder
 	read := func(fe FileEnt) ([]byte, error) { return r.GetBlob(fe.ID) }
-	for _, d := range withRenames(DiffFlat(a, b)) {
+	for _, d := range r.withRenames(DiffFlat(a, b)) {
 		if d.Kind == "R" {
 			fmt.Fprintf(&sb, "renamed: %s -> %s\n", d.From, d.Path)
 			if d.Old.Mode != d.New.Mode {
 				fmt.Fprintf(&sb, "mode change: %s %s -> %s\n", d.Path, d.Old.Mode, d.New.Mode)
 			}
-			continue
+			if d.Old.ID == d.New.ID {
+				continue
+			}
 		}
 		var od, nd []byte
 		var err error
@@ -541,6 +574,7 @@ func (r *Repo) diffBetween(a, b Flat) (string, error) {
 			fmt.Fprintf(&sb, "added: %s (%s)\n", d.Path, d.New.Mode)
 		case "D":
 			fmt.Fprintf(&sb, "deleted: %s\n", d.Path)
+		case "R":
 		default:
 			if d.Old.Mode != d.New.Mode {
 				fmt.Fprintf(&sb, "mode change: %s %s -> %s\n", d.Path, d.Old.Mode, d.New.Mode)
@@ -1229,7 +1263,7 @@ func cmdCat(r *Repo, args []string) error {
 		return errors.New("usage: cat <id>")
 	}
 	id := args[0]
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		var err error
 		if id, err = r.ResolveRev(id); err != nil {
 			return err
@@ -1274,12 +1308,14 @@ func cmdServe(args []string) error {
 			if len(tok) < 16 {
 				return fmt.Errorf("%s: tokens must be at least 16 characters", *tokens)
 			}
-			for i, pre := range scope {
-				pre = strings.Trim(pre, "/")
-				if !validPath(pre) {
-					return fmt.Errorf("%s: bad path %q", *tokens, scope[i])
+			for _, list := range [][]string{scope.Write, scope.Read} {
+				for i, pre := range list {
+					pre = strings.Trim(pre, "/")
+					if !validPath(pre) {
+						return fmt.Errorf("%s: bad path %q", *tokens, list[i])
+					}
+					list[i] = pre
 				}
-				scope[i] = pre
 			}
 		}
 	}
