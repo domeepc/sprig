@@ -88,6 +88,7 @@ type Change struct {
 	Message   string     `json:"message"`
 	Meta      Meta       `json:"meta"`
 	Conflicts []Conflict `json:"conflicts,omitempty"`
+	Sig       *Signature `json:"sig,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -101,8 +102,9 @@ type Repo struct {
 type Config struct {
 	Author  string            `json:"author,omitempty"`
 	Remotes map[string]string `json:"remotes,omitempty"`
-	Lazy    string            `json:"lazy,omitempty"`   // remote that missing objects are fetched from on demand
-	Sparse  []string          `json:"sparse,omitempty"` // only these path prefixes are in the working tree
+	Lazy    string            `json:"lazy,omitempty"`         // remote that missing objects are fetched from on demand
+	Sparse  []string          `json:"sparse,omitempty"`       // only these path prefixes are in the working tree
+	Trusted map[string]string `json:"trusted_keys,omitempty"` // signing key -> who it belongs to
 }
 
 // inView reports whether path p is part of a sparse working tree.
