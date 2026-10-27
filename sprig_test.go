@@ -779,6 +779,7 @@ func seedServer(t *testing.T, s *Server) (string, *Repo) {
 	t.Helper()
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
+	t.Cleanup(s.Stop) // runs first: ends long-polls so Close needn't wait
 	newRepo(t)
 	must(t, "remote", "add", "origin", ts.URL)
 	write(t, "a.txt", "a\n")
@@ -907,6 +908,7 @@ func TestCacheServer(t *testing.T) {
 	cache.upstream = newRemote("upstream", url)
 	cts := httptest.NewServer(cache.Handler())
 	defer cts.Close()
+	defer cache.Stop()
 
 	t.Chdir(t.TempDir())
 	must(t, "clone", cts.URL, "w")
@@ -1218,7 +1220,8 @@ func TestCachesLandOnSeparateDisks(t *testing.T) {
 	srv, _ := InitRepo(t.TempDir(), true, "main")
 	var swaps int
 	var mu sync.Mutex
-	h := NewServer(srv, "").Handler()
+	ms := NewServer(srv, "")
+	h := ms.Handler()
 	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/v1/land" {
 			t.Error("landing reached the main server; the cache should merge it")
@@ -1231,6 +1234,7 @@ func TestCachesLandOnSeparateDisks(t *testing.T) {
 		h.ServeHTTP(w, req)
 	}))
 	defer main.Close()
+	defer ms.Stop()
 	newRepo(t)
 	must(t, "remote", "add", "origin", main.URL)
 	write(t, "a.txt", "a\n")
@@ -1244,6 +1248,7 @@ func TestCachesLandOnSeparateDisks(t *testing.T) {
 		c.upstream = newRemote("upstream", main.URL)
 		ts := httptest.NewServer(c.Handler())
 		defer ts.Close()
+		defer c.Stop()
 		caches = append(caches, ts.URL)
 	}
 	errs := make(chan error, 20)
@@ -1647,4 +1652,96 @@ func TestRenameDetectionScales(t *testing.T) {
 		t.Fatalf("rename detection took %v", took)
 	}
 	t.Logf("1000 renames (500 edited) in %v", took)
+}
+
+func TestStandbyLongPollReflogFailover(t *testing.T) {
+	srv, _ := InitRepo(t.TempDir(), true, "main")
+	srv.Durable = true
+	url, repo := seedServer(t, NewServer(srv, ""))
+	rm := newRemote("t", url)
+	refs, etag, err := rm.WaitRefs("")
+	if err != nil || refs["heads/main"] == "" {
+		t.Fatalf("refs: %v %v", refs, err)
+	}
+
+	// long-poll returns as soon as a push lands
+	got := make(chan string, 1)
+	go func() {
+		r2, _, _ := rm.WaitRefs(etag)
+		got <- r2["heads/main"]
+	}()
+	time.Sleep(50 * time.Millisecond)
+	write(t, "a.txt", "pushed\n")
+	must(t, "commit", "-m", "wake up")
+	start := time.Now()
+	must(t, "push")
+	select {
+	case tip := <-got:
+		if now, _ := repo.ReadRef("heads/main"); tip != now {
+			t.Fatal("long-poll returned stale refs")
+		}
+		if time.Since(start) > 2*time.Second {
+			t.Fatal("long-poll was slow to wake")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("long-poll never woke")
+	}
+
+	// the reflog has the push and a landing
+	if err := land(t, url, "", map[string]*LandFile{"d/y.txt": {Mode: "file", Data: []byte("y")}}); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := repo.Reflog()
+	if len(log) < 2 || log[len(log)-2].Via != "push" || log[len(log)-1].Via != "land" {
+		t.Fatalf("reflog: %+v", log)
+	}
+
+	// failover: a dead first server is skipped
+	if refs, err := newRemote("t", "http://127.0.0.1:1,"+url).Refs(); err != nil || refs["heads/main"] == "" {
+		t.Fatalf("failover: %v", err)
+	}
+
+	// a standby mirrors the main server and refuses writes
+	sb, _ := InitRepo(t.TempDir(), true, "main")
+	ss := NewServer(sb, "")
+	ss.follow = newRemote("follow", url)
+	sts := httptest.NewServer(ss.Handler())
+	defer sts.Close()
+	defer ss.Stop()
+	want, _ := repo.ReadRef("heads/main")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if id, _ := sb.ReadRef("heads/main"); id == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("standby never caught up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	must(t, "pull") // the landing above moved main on the server
+	write(t, "a.txt", "after standby\n")
+	must(t, "commit", "-m", "followed")
+	must(t, "push")
+	want, _ = repo.ReadRef("heads/main")
+	for deadline = time.Now().Add(5 * time.Second); ; {
+		if id, _ := sb.ReadRef("heads/main"); id == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("standby did not follow a new push")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if flat, err := sb.ChangeFlat(want); err != nil || flat["a.txt"].ID == "" {
+		t.Fatalf("standby lacks objects: %v", err)
+	}
+	if err := land(t, sts.URL, "", map[string]*LandFile{"z": {Mode: "file", Data: []byte("z")}}); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("standby accepted a landing: %v", err)
+	}
+	t.Chdir(t.TempDir())
+	must(t, "clone", sts.URL, "w")
+	if read(t, "w/a.txt") != "after standby\n" {
+		t.Fatal("clone from standby is stale")
+	}
 }
