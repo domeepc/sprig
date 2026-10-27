@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -28,9 +29,22 @@ const (
 )
 
 var (
-	idRe      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	refNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
 )
+
+// isID reports whether s is a full object id (64 lowercase hex digits).
+// It is on hot paths, so it avoids a regexp.
+func isID(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func validRefName(n string) bool {
 	if !refNameRe.MatchString(n) {
@@ -97,6 +111,8 @@ type Repo struct {
 	Root string // working tree root ("" for a bare repo)
 	Dir  string // storage directory
 	Bare bool
+
+	fallback *Remote // a cache's upstream: missing objects are fetched from it
 }
 
 type Config struct {
@@ -189,17 +205,20 @@ func (r *Repo) objPath(id string) string {
 }
 
 func (r *Repo) HasObject(id string) bool {
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		return false
 	}
-	_, err := os.Stat(r.objPath(id))
-	return err == nil
+	if _, err := os.Stat(r.objPath(id)); err == nil {
+		return true
+	}
+	_, _, ok := r.inPack(id)
+	return ok
 }
 
 func (r *Repo) PutObject(typ string, data []byte) (string, error) {
 	id := HashObject(typ, data)
 	p := r.objPath(id)
-	if _, err := os.Stat(p); err == nil {
+	if r.HasObject(id) {
 		return id, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -238,16 +257,20 @@ var errObjectNotFound = errors.New("not found")
 // the configured remote (hash-verified) and kept.
 func (r *Repo) GetObject(id string) (string, []byte, error) {
 	typ, data, err := r.getLocal(id)
-	if !errors.Is(err, errObjectNotFound) || r.Bare {
+	if !errors.Is(err, errObjectNotFound) {
 		return typ, data, err
 	}
-	c := r.LoadConfig()
-	if c.Lazy == "" {
-		return typ, data, err
+	rm := r.fallback
+	if rm == nil && !r.Bare {
+		if c := r.LoadConfig(); c.Lazy != "" {
+			var rerr error
+			if rm, rerr = r.Remote(c.Lazy); rerr != nil {
+				return "", nil, rerr
+			}
+		}
 	}
-	rm, rerr := r.Remote(c.Lazy)
-	if rerr != nil {
-		return "", nil, rerr
+	if rm == nil {
+		return typ, data, err
 	}
 	if typ, data, err = rm.GetObject(id); err != nil {
 		return "", nil, err
@@ -256,8 +279,19 @@ func (r *Repo) GetObject(id string) (string, []byte, error) {
 	return typ, data, err
 }
 
-func (r *Repo) getLocal(id string) (string, []byte, error) {
-	if !idRe.MatchString(id) {
+func (r *Repo) getLocal(id string) (string, []byte, error) { return r.readLocalAt(id, 0) }
+
+// readLocalAt reads a loose or packed object; depth counts delta hops.
+func (r *Repo) readLocalAt(id string, depth int) (string, []byte, error) {
+	typ, data, err := r.readLoose(id)
+	if errors.Is(err, errObjectNotFound) {
+		return r.readPacked(id, depth)
+	}
+	return typ, data, err
+}
+
+func (r *Repo) readLoose(id string) (string, []byte, error) {
+	if !isID(id) {
 		return "", nil, fmt.Errorf("invalid object id %q", id)
 	}
 	f, err := os.Open(r.objPath(id))
@@ -351,12 +385,12 @@ func Children(typ string, data []byte) ([]string, error) {
 		}
 		var ids []string
 		for _, p := range c.Parents {
-			if !idRe.MatchString(p) {
+			if !isID(p) {
 				return nil, fmt.Errorf("bad parent id %q", p)
 			}
 			ids = append(ids, p)
 		}
-		if !idRe.MatchString(c.Tree) {
+		if !isID(c.Tree) {
 			return nil, fmt.Errorf("bad tree id %q", c.Tree)
 		}
 		ids = append(ids, c.Tree)
@@ -368,7 +402,7 @@ func Children(typ string, data []byte) ([]string, error) {
 				if b == "" {
 					continue
 				}
-				if !idRe.MatchString(b) {
+				if !isID(b) {
 					return nil, fmt.Errorf("bad conflict blob id %q", b)
 				}
 				ids = append(ids, b)
@@ -407,7 +441,7 @@ func (r *Repo) ReadRef(name string) (string, bool) {
 		return "", false
 	}
 	id := strings.TrimSpace(string(b))
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		return "", false
 	}
 	return id, true
@@ -437,7 +471,7 @@ func (r *Repo) WriteRef(name, id string) error {
 	if !validRefName(name) {
 		return fmt.Errorf("invalid ref name %q", name)
 	}
-	if !idRe.MatchString(id) {
+	if !isID(id) {
 		return fmt.Errorf("invalid id %q", id)
 	}
 	return atomicWrite(r.refPath(name), []byte(id+"\n"))
@@ -510,7 +544,7 @@ func (r *Repo) Head() (ref, id string) {
 		id, _ = r.ReadRef(ref)
 		return ref, id
 	}
-	if idRe.MatchString(raw) {
+	if isID(raw) {
 		return "", raw
 	}
 	return "", ""
@@ -696,7 +730,7 @@ func (r *Repo) resolveBase(s string) (string, error) {
 			return id, nil
 		}
 	}
-	if idRe.MatchString(s) {
+	if isID(s) {
 		if !r.HasObject(s) {
 			return "", fmt.Errorf("unknown change %s", short(s))
 		}
@@ -706,12 +740,15 @@ func (r *Repo) resolveBase(s string) (string, error) {
 		dir := filepath.Join(r.Dir, "objects", s[:2])
 		ents, _ := os.ReadDir(dir)
 		var found []string
+		cands := r.packedPrefix(s)
 		for _, e := range ents {
 			if strings.HasPrefix(e.Name(), s[2:]) {
-				id := s[:2] + e.Name()
-				if typ, _, err := r.GetObject(id); err == nil && typ == TypeChange {
-					found = append(found, id)
-				}
+				cands = append(cands, s[:2]+e.Name())
+			}
+		}
+		for _, id := range cands {
+			if typ, _, err := r.GetObject(id); err == nil && typ == TypeChange && !slices.Contains(found, id) {
+				found = append(found, id)
 			}
 		}
 		sort.Strings(found)
