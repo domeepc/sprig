@@ -2,15 +2,20 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -64,6 +69,7 @@ func newRepo(t *testing.T) string {
 	t.Setenv("SPRIG_AGENT", "")
 	t.Setenv("SPRIG_MODEL", "")
 	t.Setenv("SPRIG_KEY", filepath.Join(dir, "no-key")) // never sign with the developer's real key
+	t.Setenv("SPRIG_NO_AUTOGC", "1")                    // the test binary must not spawn itself as `sprig gc`
 	must(t, "init")
 	return dir
 }
@@ -1343,7 +1349,7 @@ func TestGCPacks(t *testing.T) {
 	must(t, "commit", "-m", "after gc")
 	must(t, "gc")
 	must(t, "push")
-	if _, err := srv.GC(); err != nil {
+	if _, err := srv.GC(false); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(t.TempDir())
@@ -1417,5 +1423,106 @@ func TestWatcherMatchesWalk(t *testing.T) {
 	}
 	if _, ok := watched["newdir/sub/x.txt"]; !ok {
 		t.Fatal("file in a new directory missed")
+	}
+}
+
+func TestPackFormats(t *testing.T) {
+	// both delta encoders round-trip, and the block one finds mid-line matches
+	base := []byte(strings.Repeat("0123456789abcdef", 40))
+	target := append(append([]byte{}, base[:300]...), append([]byte("INSERTED"), base[300:]...)...)
+	for _, d := range [][]byte{makeDelta(base, target), blockDelta(base, target), bestDelta(base, target)} {
+		if got, err := applyDelta(base, d); err != nil || !bytes.Equal(got, target) {
+			t.Fatalf("delta round trip failed: %v", err)
+		}
+	}
+	if d := blockDelta(base, target); len(d) > 40 {
+		t.Fatalf("block delta too big: %d bytes", len(d))
+	}
+	// compact trees expand to the exact JSON
+	tr, _ := json.Marshal(Tree{Entries: []Entry{{"a<b>.go", "file", HashObject("blob", nil)}, {"d", "dir", HashObject("tree", nil)}}})
+	c, ok := compactTree(tr)
+	if !ok || len(c) >= len(tr)/2 {
+		t.Fatalf("compact tree: ok=%v %d vs %d bytes", ok, len(c), len(tr))
+	}
+	if back, err := expandTree(c); err != nil || !bytes.Equal(back, tr) {
+		t.Fatalf("compact tree round trip: %s %v", back, err)
+	}
+
+	// a v1 (zlib) pack written by older sprig stays readable, and repack converts it
+	newRepo(t)
+	write(t, "a.txt", "v1 pack content\n")
+	must(t, "commit", "-m", "one")
+	r, _ := FindRepo()
+	_, head := r.Head()
+	c1, _ := r.GetChange(head)
+	var pk, idx bytes.Buffer
+	var ids []string
+	filepath.WalkDir(filepath.Join(r.Dir, "objects"), func(p string, d fs.DirEntry, err error) error {
+		if !d.IsDir() {
+			ids = append(ids, filepath.Base(filepath.Dir(p))+d.Name())
+		}
+		return nil
+	})
+	sort.Strings(ids)
+	for _, id := range ids {
+		typ, data, _ := r.getLocal(id)
+		raw, _ := hex.DecodeString(id)
+		idx.Write(raw)
+		binary.Write(&idx, binary.BigEndian, uint64(pk.Len()))
+		zw := zlib.NewWriter(&pk)
+		fmt.Fprintf(zw, "%s - %d\x00", typ, len(data))
+		zw.Write(data)
+		zw.Close()
+	}
+	os.MkdirAll(r.packDir(), 0o755)
+	os.WriteFile(filepath.Join(r.packDir(), "pack-old.pack"), pk.Bytes(), 0o644)
+	os.WriteFile(filepath.Join(r.packDir(), "pack-old.idx"), idx.Bytes(), 0o644)
+	os.RemoveAll(filepath.Join(r.Dir, "objects"))
+	os.MkdirAll(filepath.Join(r.Dir, "objects"), 0o755)
+	r.packList(true)
+	if got, err := r.GetChange(head); err != nil || got.Tree != c1.Tree {
+		t.Fatalf("v1 pack unreadable: %v", err)
+	}
+	for i := range 10 { // more packs than repackAt: the next gc merges them
+		write(t, "a.txt", fmt.Sprint("version ", i, "\n"))
+		must(t, "commit", "-m", fmt.Sprint(i))
+		must(t, "gc")
+	}
+	if n := len(r.packList(true)); n > 2 {
+		t.Fatalf("%d packs left; gc should have merged them", n)
+	}
+	must(t, "gc", "--repack")
+	if ps := r.packList(true); len(ps) != 1 || !ps[0].v2 {
+		t.Fatalf("repack left %d packs", len(ps))
+	}
+	if out := must(t, "log", "-n", "20"); strings.Count(out, "change ") != 11 {
+		t.Fatalf("history lost in repack: %s", out)
+	}
+}
+
+func TestAutoGC(t *testing.T) {
+	newRepo(t)
+	t.Setenv("SPRIG_NO_AUTOGC", "")
+	var ran int
+	old := startGC
+	startGC = func(r *Repo) { ran++; r.GC(false) }
+	defer func() { startGC = old }()
+	write(t, "a.txt", "a")
+	must(t, "commit", "-m", "small")
+	if ran != 0 {
+		t.Fatal("auto gc ran for a tiny repo")
+	}
+	r, _ := FindRepo()
+	os.MkdirAll(filepath.Join(r.Dir, "objects", "17"), 0o755)
+	for i := range autoGCLoose/256 + 1 { // fake a full fan-out dir; they are not valid ids, so gc skips them
+		os.WriteFile(filepath.Join(r.Dir, "objects", "17", fmt.Sprintf("x%d", i)), nil, 0o644)
+	}
+	write(t, "a.txt", "b")
+	must(t, "commit", "-m", "trigger")
+	if ran != 1 {
+		t.Fatalf("auto gc ran %d times", ran)
+	}
+	if _, err := os.Stat(filepath.Join(r.Dir, "gc.lock")); err == nil {
+		t.Fatal("gc.lock left behind")
 	}
 }
