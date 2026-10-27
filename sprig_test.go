@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // sp runs a sprig command in the current directory and returns its output.
@@ -1348,5 +1350,72 @@ func TestGCPacks(t *testing.T) {
 	must(t, "clone", url, "w")
 	if read(t, "w/big.txt") != "rewritten\n" {
 		t.Fatal("clone from a packed server failed")
+	}
+}
+
+func TestStatCacheRacyEdit(t *testing.T) {
+	newRepo(t)
+	write(t, "a.txt", "one\n")
+	must(t, "commit", "-m", "one")
+	// same size, same mtime, within the racy window: must still be seen
+	st, _ := os.Stat("a.txt")
+	write(t, "a.txt", "two\n")
+	os.Chtimes("a.txt", st.ModTime(), st.ModTime())
+	if out := must(t, "status"); !strings.Contains(out, "M a.txt") {
+		t.Fatalf("racy edit missed: %s", out)
+	}
+}
+
+func TestWatcherMatchesWalk(t *testing.T) {
+	newRepo(t)
+	t.Setenv("SPRIG_NO_WATCH", "")
+	for i := range 30 {
+		write(t, fmt.Sprintf("d%d/f%d.txt", i%3, i), fmt.Sprint(i))
+	}
+	must(t, "commit", "-m", "base")
+	r, _ := FindRepo()
+	stop := make(chan struct{})
+	ready := make(chan struct{})
+	go r.Watch(stop, func() { close(ready) })
+	defer close(stop)
+	<-ready
+	time.Sleep(1100 * time.Millisecond) // let the cache's save time fall inside what the watcher vouches for
+	must(t, "status")                   // saves a cache the watcher can vouch for
+	write(t, "d1/f1.txt", "changed")
+	os.Remove("d2/f2.txt")
+	write(t, "newdir/sub/x.txt", "new")
+	os.Rename("d0/f0.txt", "d0/g0.txt")
+	snapWith := func(watch string) Flat {
+		t.Setenv("SPRIG_NO_WATCH", watch)
+		f, err := r.Snapshot(false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		cache := r.loadStatCache()
+		dirty, ok, _ := r.askWatcher(cache)
+		if ok && slices.Contains(dirty, "newdir") && slices.Contains(dirty, "d0/g0.txt") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watcher never reported the changes: %v %v", dirty, ok)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	walked := snapWith("1")
+	watched := snapWith("")
+	if len(walked) != len(watched) {
+		t.Fatalf("watcher snapshot has %d files, walk %d", len(watched), len(walked))
+	}
+	for p, fe := range walked {
+		if watched[p] != fe {
+			t.Fatalf("%s differs: watch %v walk %v", p, watched[p], fe)
+		}
+	}
+	if _, ok := watched["newdir/sub/x.txt"]; !ok {
+		t.Fatal("file in a new directory missed")
 	}
 }
