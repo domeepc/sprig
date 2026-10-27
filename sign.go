@@ -22,6 +22,10 @@ type Signature struct {
 	Key  string     `json:"key"` // "ed25519:<base64 public key>"
 	Sig  string     `json:"sig"` // base64
 	Land *LandProof `json:"land,omitempty"`
+	// Moved: signed paths the server edited at a new path, because someone
+	// else had renamed them since the signed base. Not signed; checked
+	// against history instead.
+	Moved map[string]string `json:"moved,omitempty"`
 }
 
 type LandProof struct {
@@ -147,8 +151,28 @@ func (r *Repo) VerifyChange(c *Change) (string, error) {
 	if err != nil {
 		return c.Sig.Key, err
 	}
+	allowed := map[string]bool{}
+	for f := range p.Files {
+		allowed[f] = true
+	}
+	if len(c.Sig.Moved) > 0 {
+		based, err := r.ChangeFlat(p.Base)
+		if err != nil {
+			return c.Sig.Key, err
+		}
+		for from, to := range c.Sig.Moved {
+			_, signed := p.Files[from]
+			_, inBase := based[from]
+			_, stillThere := before[from]
+			_, movedThere := before[to]
+			if !signed || !inBase || stillThere || !movedThere {
+				return c.Sig.Key, fmt.Errorf("unsupported move claim %s -> %s", from, to)
+			}
+			allowed[to] = true
+		}
+	}
 	for _, d := range DiffFlat(before, after) {
-		if _, signed := p.Files[d.Path]; !signed {
+		if !allowed[d.Path] {
 			return c.Sig.Key, fmt.Errorf("server changed unsigned path %s", d.Path)
 		}
 	}

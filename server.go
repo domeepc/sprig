@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -451,7 +453,46 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 				theirs[p] = te
 			}
 		}
-		merged, conflicts, err := s.repo.MergeFlat(base, ours, theirs, "landing", u.Branch)
+		// An edited file someone else renamed since the base: edit it at its
+		// new path (the only case that needs whole trees).
+		paths := slices.Collect(maps.Keys(u.Files))
+		b2, o2, t2 := base, ours, theirs
+		moved := map[string]string{}
+		for _, p := range paths {
+			if _, inB := base[p]; inB && ours[p].ID != "" && theirs[p].ID == "" {
+				moved[p] = ""
+			}
+		}
+		if len(moved) > 0 {
+			bf, err1 := s.repo.Flatten(baseTree)
+			tf, err2 := s.repo.Flatten(tipTree)
+			if err1 != nil || err2 != nil {
+				httpErr(w, 500, "%v", errors.Join(err1, err2))
+				return
+			}
+			ren := s.repo.renames(bf, tf)
+			b2, o2, t2 = maps.Clone(base), maps.Clone(ours), maps.Clone(theirs)
+			for p := range moved {
+				q, ok := ren[p]
+				if !ok {
+					delete(moved, p)
+					continue
+				}
+				if scoped && !inScope(scope, q) {
+					httpErr(w, 403, "%s was moved to %s, which this token may not write", p, q)
+					return
+				}
+				moved[p] = q
+				b2[q], o2[q] = b2[p], o2[p]
+				delete(b2, p)
+				delete(o2, p)
+				if te, ok := tf[q]; ok {
+					t2[q] = te
+				}
+				paths[slices.Index(paths, p)] = q
+			}
+		}
+		merged, conflicts, err := s.repo.MergeFlat(b2, o2, t2, "landing", u.Branch)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -467,7 +508,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		edits := map[string]*FileEnt{}
-		for p := range u.Files {
+		for _, p := range paths {
 			if fe, ok := merged[p]; ok {
 				edits[p] = &fe
 			} else {
@@ -485,7 +526,7 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		}
 		now := time.Now()
 		id, err := s.repo.PutChange(&Change{Parents: parents, Tree: tree, Author: u.Author,
-			Time: now.Unix(), TZ: now.Format("-0700"), Message: u.Message, Meta: u.Meta, Sig: sig})
+			Time: now.Unix(), TZ: now.Format("-0700"), Message: u.Message, Meta: u.Meta, Sig: withMoved(sig, moved)})
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -496,12 +537,12 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 		}
-		moved, err := s.swapRef(name, tip, id)
+		raced, err := s.swapRef(name, tip, id)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
 		}
-		if moved {
+		if raced {
 			continue // someone landed meanwhile: re-merge onto the new tip
 		}
 		writeJSON(w, 200, LandResult{id, tip, retries})
@@ -509,6 +550,17 @@ func (s *Server) handleLand(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	httpErr(w, 503, "%s moved %d times during landing; try again", u.Branch, maxLandRetries)
+}
+
+// withMoved records on a landing's signature which signed paths were edited
+// at the new path someone else had renamed them to.
+func withMoved(sig *Signature, moved map[string]string) *Signature {
+	if sig == nil || len(moved) == 0 {
+		return sig
+	}
+	c := *sig
+	c.Moved = moved
+	return &c
 }
 
 // readRef reads a branch tip, from upstream when this server is a cache.
