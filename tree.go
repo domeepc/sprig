@@ -10,7 +10,9 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Entry struct {
@@ -51,7 +53,7 @@ func parseTree(data []byte) (*Tree, error) {
 	}
 	seen := map[string]bool{}
 	for _, e := range t.Entries {
-		if !validName(e.Name) || !validMode(e.Mode) || !idRe.MatchString(e.ID) {
+		if !validName(e.Name) || !validMode(e.Mode) || !isID(e.ID) {
 			return nil, fmt.Errorf("bad tree entry %+v", e)
 		}
 		if seen[e.Name] {
@@ -90,7 +92,52 @@ func (r *Repo) Flatten(treeID string) (Flat, error) {
 	if treeID == "" {
 		return out, nil
 	}
-	return out, r.flatten(treeID, "", out)
+	if !r.Bare {
+		if f, ok := r.loadFlatMemo(treeID); ok {
+			return f, nil
+		}
+	}
+	err := r.flatten(treeID, "", out)
+	if err == nil && !r.Bare {
+		r.saveFlatMemo(treeID, out)
+	}
+	return out, err
+}
+
+// The flat memo keeps the most recently flattened tree (almost always HEAD's)
+// so status doesn't decode every tree object each run.
+func (r *Repo) flatMemoPath() string { return filepath.Join(r.Dir, "flatmemo") }
+
+func (r *Repo) loadFlatMemo(treeID string) (Flat, bool) {
+	b, err := os.ReadFile(r.flatMemoPath())
+	if err != nil {
+		return nil, false
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if lines[0] != treeID {
+		return nil, false
+	}
+	out := Flat{}
+	for _, l := range lines[1:] {
+		f := strings.Split(l, "\t")
+		if len(f) != 3 {
+			return nil, false
+		}
+		out[f[0]] = FileEnt{f[1], f[2]}
+	}
+	return out, true
+}
+
+func (r *Repo) saveFlatMemo(treeID string, f Flat) {
+	var b strings.Builder
+	b.WriteString(treeID + "\n")
+	for p, fe := range f {
+		if strings.ContainsAny(p, "\t\n") {
+			return
+		}
+		b.WriteString(p + "\t" + fe.Mode + "\t" + fe.ID + "\n")
+	}
+	atomicWrite(r.flatMemoPath(), []byte(b.String()))
 }
 
 func (r *Repo) flatten(id, prefix string, out Flat) error {
@@ -280,9 +327,9 @@ func DiffFlat(a, b Flat) []Delta {
 	return out
 }
 
-// withRenames pairs a deleted and an added file with identical content into
-// one rename. shortcut: exact-content renames only; similarity scoring would also catch rename+edit.
-func withRenames(ds []Delta) []Delta {
+// withRenames pairs deleted and added files into renames: identical content
+// first, then files sharing at least half their lines (a rename plus an edit).
+func (r *Repo) withRenames(ds []Delta) []Delta {
 	gone := map[string][]int{} // blob id -> indexes of deletions
 	for i, d := range ds {
 		if d.Kind == "D" {
@@ -290,6 +337,7 @@ func withRenames(ds []Delta) []Delta {
 		}
 	}
 	drop := map[int]bool{}
+	var adds, dels []int
 	for i, d := range ds {
 		if d.Kind != "A" || len(gone[d.New.ID]) == 0 {
 			continue
@@ -298,6 +346,67 @@ func withRenames(ds []Delta) []Delta {
 		gone[d.New.ID] = gone[d.New.ID][1:]
 		ds[i] = Delta{d.Path, "R", ds[j].Old, d.New, ds[j].Path}
 		drop[j] = true
+	}
+	for i, d := range ds {
+		switch {
+		case d.Kind == "A":
+			adds = append(adds, i)
+		case d.Kind == "D" && !drop[i]:
+			dels = append(dels, i)
+		}
+	}
+	// shortcut: similarity is only tried for up to 50x50 candidates, to keep big diffs fast.
+	if len(adds) > 0 && len(dels) > 0 && len(adds) <= 50 && len(dels) <= 50 {
+		lines := map[int]map[string]int{}
+		count := func(i int, fe FileEnt) map[string]int {
+			if m, ok := lines[i]; ok {
+				return m
+			}
+			data, err := r.GetBlob(fe.ID)
+			if err != nil && !r.Bare { // a working-tree file not in the store yet
+				data, err = os.ReadFile(r.abs(ds[i].Path))
+			}
+			var m map[string]int
+			if err == nil && len(data) < 1<<20 && !isBinary(data) {
+				m = map[string]int{}
+				for _, l := range splitLines(data) {
+					m[l]++
+				}
+			}
+			lines[i] = m
+			return m
+		}
+		type pair struct{ a, d, score int }
+		var pairs []pair
+		for _, a := range adds {
+			am := count(a, ds[a].New)
+			for _, d := range dels {
+				dm := count(d, ds[d].Old)
+				if len(am) == 0 || len(dm) == 0 || ds[a].New.Mode != ds[d].Old.Mode {
+					continue
+				}
+				common, total := 0, 0
+				for l, n := range am {
+					common += min(n, dm[l])
+					total += n
+				}
+				for _, n := range dm {
+					total += n
+				}
+				if score := 200 * common / total; score >= 50 {
+					pairs = append(pairs, pair{a, d, score})
+				}
+			}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
+		used := map[int]bool{}
+		for _, p := range pairs {
+			if used[p.a] || used[p.d] {
+				continue
+			}
+			used[p.a], used[p.d], drop[p.d] = true, true, true
+			ds[p.a] = Delta{ds[p.a].Path, "R", ds[p.d].Old, ds[p.a].New, ds[p.d].Path}
+		}
 	}
 	out := ds[:0]
 	for i, d := range ds {
@@ -353,6 +462,8 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 	}
 	pats := r.loadIgnore()
 	cfg := r.LoadConfig()
+	cache := r.loadStatCache()
+	fresh := statCache{Written: time.Now().UnixNano(), Files: map[string]statEntry{}, dirty: len(cache.Files) == 0}
 	flat := Flat{}
 	err := filepath.WalkDir(r.Root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -376,25 +487,39 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 		if err != nil {
 			return err
 		}
-		var data []byte
 		mode := "file"
+		switch {
+		case info.Mode()&fs.ModeSymlink != 0:
+			mode = "link"
+		case !info.Mode().IsRegular():
+			return nil // sockets, devices, ...
+		case info.Mode()&0o111 != 0:
+			mode = "exec"
+		}
+		// Unchanged size, mtime and mode: reuse the recorded hash instead of
+		// reading the file. Entries written less than a second before the
+		// cache was saved are not trusted, since an edit within the same
+		// timestamp tick would be invisible ("racily clean", as git calls it).
+		st := statEntry{info.Size(), info.ModTime().UnixNano(), mode, ""}
+		if e, ok := cache.Files[rel]; ok && e.Size == st.Size && e.MTime == st.MTime && e.Mode == mode &&
+			e.MTime < cache.Written-int64(time.Second) && (!store || r.HasObject(e.ID)) {
+			flat[rel] = FileEnt{mode, e.ID}
+			fresh.Files[rel] = e
+			return nil
+		}
+		var data []byte
 		switch {
 		case info.Mode()&fs.ModeSymlink != 0:
 			target, err := os.Readlink(p)
 			if err != nil {
 				return err
 			}
-			data, mode = []byte(target), "link"
-		case info.Mode().IsRegular():
+			data = []byte(target)
+		default:
 			data, err = os.ReadFile(p)
 			if err != nil {
 				return err
 			}
-			if info.Mode()&0o111 != 0 {
-				mode = "exec"
-			}
-		default:
-			return nil // sockets, devices, ...
 		}
 		var id string
 		if store {
@@ -406,8 +531,14 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 			id = HashObject(TypeBlob, data)
 		}
 		flat[rel] = FileEnt{mode, id}
+		st.ID = id
+		fresh.Files[rel] = st
+		fresh.dirty = true
 		return nil
 	})
+	if err == nil && (fresh.dirty || len(fresh.Files) != len(cache.Files)) {
+		r.saveStatCache(fresh)
+	}
 	if err != nil || len(cfg.Sparse) == 0 {
 		return flat, err
 	}
@@ -420,6 +551,57 @@ func (r *Repo) Snapshot(store bool) (Flat, error) {
 		}
 	}
 	return flat, err
+}
+
+// The stat cache remembers each working file's size, mtime and hash so that
+// status and commit only read files that may have changed. It is one
+// tab-separated line per file, after a first line holding the save time.
+type statEntry struct {
+	Size  int64
+	MTime int64
+	Mode  string
+	ID    string
+}
+
+type statCache struct {
+	Written int64
+	Files   map[string]statEntry
+	dirty   bool // an entry was added or changed since loading
+}
+
+func (r *Repo) statCachePath() string { return filepath.Join(r.Dir, "statcache") }
+
+func (r *Repo) loadStatCache() statCache {
+	c := statCache{Files: map[string]statEntry{}}
+	b, err := os.ReadFile(r.statCachePath())
+	if err != nil {
+		return c
+	}
+	lines := strings.Split(string(b), "\n")
+	c.Written, _ = strconv.ParseInt(lines[0], 10, 64)
+	for _, l := range lines[1:] {
+		f := strings.Split(l, "\t")
+		if len(f) != 5 {
+			continue
+		}
+		size, err1 := strconv.ParseInt(f[1], 10, 64)
+		mtime, err2 := strconv.ParseInt(f[2], 10, 64)
+		if err1 == nil && err2 == nil {
+			c.Files[f[0]] = statEntry{size, mtime, f[3], f[4]}
+		}
+	}
+	return c
+}
+
+func (r *Repo) saveStatCache(c statCache) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d\n", c.Written)
+	for p, e := range c.Files {
+		if !strings.ContainsAny(p, "\t\n") {
+			fmt.Fprintf(&b, "%s\t%d\t%d\t%s\t%s\n", p, e.Size, e.MTime, e.Mode, e.ID)
+		}
+	}
+	atomicWrite(r.statCachePath(), []byte(b.String())) // best effort: losing it only costs a re-read
 }
 
 // dirInView reports whether a directory holds anything in the sparse view.
