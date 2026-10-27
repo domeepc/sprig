@@ -73,6 +73,8 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   cat <id>                            print a raw object
   gc [--repack]                       pack loose objects with deltas (runs by itself when they pile up)
   watch                               keep a list of changed files so status needn't stat every file
+  github set <url> | github pull | github push
+                                      sync the current branch with a GitHub (or any git) repository
   sparse [path... | .]                 show or change which paths are checked out (. = all)
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
@@ -280,6 +282,7 @@ pub fn run(cmd: &str, args: &[String], out: Out) -> Result<()> {
         "cat" => cmd_cat(&r, args, out),
         "sparse" => cmd_sparse(&r, args, out),
         "trust" => cmd_trust(&r, args, out),
+        "github" => cmd_github(&r, args, out),
         "watch" => {
             let root = r.root.display().to_string();
             crate::watch::watch(&r, || {
@@ -293,7 +296,7 @@ pub fn run(cmd: &str, args: &[String], out: Out) -> Result<()> {
             return Err(Error::Exit(2, format!("unknown command {cmd:?}")));
         }
     };
-    if matches!(cmd, "commit" | "merge" | "land" | "fetch" | "pull" | "resolve" | "import-git") {
+    if matches!(cmd, "commit" | "merge" | "land" | "fetch" | "pull" | "resolve" | "import-git" | "github") {
         r.maybe_auto_gc(); // these add objects
     }
     res
@@ -447,7 +450,7 @@ fn cmd_status(r: &Repo, args: &[String], out: Out) -> Result<()> {
     Ok(())
 }
 
-fn print_change_header(r: &Repo, out: Out, id: &str, c: &Change, sigs: bool) -> Result<()> {
+pub fn print_change_header(r: &Repo, out: Out, id: &str, c: &Change, sigs: bool) -> Result<()> {
     let tag = if c.parents.len() > 1 { " (merge)" } else { "" };
     writeln!(out, "change {id}{tag}")?;
     writeln!(out, "Author: {}", c.author)?;
@@ -513,7 +516,7 @@ fn cmd_log(r: &Repo, args: &[String], out: Out) -> Result<()> {
 
 /// Renders deltas as a diff. New sides of the paths in work are read from
 /// the working tree, everything else from the store.
-fn render_diff(r: &Repo, out: Out, ds: Vec<Delta>, sim: usize, work: Option<&HashSet<String>>) -> Result<()> {
+pub fn render_diff(r: &Repo, out: Out, ds: Vec<Delta>, sim: usize, work: Option<&HashSet<String>>) -> Result<()> {
     let read = |fe: &Option<FileEnt>, path: &str, new: bool| -> Result<Vec<u8>> {
         let Some(fe) = fe else { return Ok(vec![]) };
         if new && work.is_some_and(|w| w.contains(path)) {
@@ -992,6 +995,35 @@ fn cmd_trust(r: &Repo, args: &[String], out: Out) -> Result<()> {
         }
         _ => bail!("usage: trust [<key> <name>]"),
     }
+}
+
+/// Syncs with a git host through a mirror in .sprig/github.git; git does
+/// the network part with the user's credentials.
+fn cmd_github(r: &Repo, args: &[String], out: Out) -> Result<()> {
+    let url = r.load_config().github;
+    match args {
+        [set, u] if set == "set" => {
+            let mut cfg = r.load_config();
+            cfg.github = u.trim().to_string();
+            r.save_config(&cfg)?;
+            writeln!(out, "syncing with {}", cfg.github)?;
+        }
+        [] => writeln!(out, "{}", if url.is_empty() { "(not set; `sprig github set <url>`)" } else { &url })?,
+        [p] if p == "pull" => {
+            let res = r.github_pull(&url)?;
+            writeln!(out, "{}", res.summary)?;
+            for c in &res.conflicts {
+                writeln!(out, "CONFLICT {c}")?;
+            }
+            if !res.conflicts.is_empty() {
+                writeln!(out, "conflicts are recorded in the change; resolve them and commit")?;
+                return Err(Error::Exit(3, String::new()));
+            }
+        }
+        [p] if p == "push" => writeln!(out, "{}", r.github_push(&url)?)?,
+        _ => bail!("usage: github set <url> | github pull | github push"),
+    }
+    Ok(())
 }
 
 fn cmd_cat(r: &Repo, args: &[String], out: Out) -> Result<()> {

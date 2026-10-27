@@ -55,6 +55,43 @@ Optional setup:
 To update: `git pull && cargo install --locked --path .`.
 To uninstall: `cargo uninstall sprig`, and delete `~/.config/sprig` if you made a key.
 
+## Desktop app
+
+`sprig-ui` is a native window on a repository (Rust, egui), for Linux,
+macOS and Windows:
+
+- **History**: every change with its diff, provenance and author.
+- **Changes**: the working tree against HEAD with colored diffs; commit
+  everything or the selected file.
+- **Branches**: switch, create, and merge one into the current branch.
+- **Sync**: pull and push with sprig servers (`sprig remote add`), and with
+  GitHub or any git host: enter the repository URL once, then Pull (fetch
+  and merge) and Push. git does the network part with your own credentials
+  (SSH key or credential helper).
+- **Conflicts**: ours, base and theirs side by side; take one side, or edit
+  the result and save it, then commit.
+- **Undo** of the last operation (again = redo).
+
+Each button runs the same code as the matching command (`checkout`,
+`merge`, `pull`, `github pull`...), so the app and the CLI behave the same
+and everything lands in `sprig ops`.
+
+```sh
+cargo install --locked --path . --features ui   # installs sprig and sprig-ui
+sprig-ui path/to/repo                           # or run it inside the repo
+```
+
+Linux needs the usual desktop libraries (X11 or Wayland, OpenGL, and
+`libxkbcommon-x11`), present on any desktop install.
+
+![history](docs/ui-history.png)
+
+![resolving a conflict](docs/ui-conflict.png)
+
+The same GitHub sync works from the command line: `sprig github set <url>`,
+then `sprig github pull` and `sprig github push` (it keeps a bare mirror in
+`.sprig/github.git` and uses `import-git`/`export-git`, described below).
+
 ## What's different from git
 
 | Idea | How sprig does it |
@@ -364,6 +401,7 @@ src/sign.rs       ed25519 change signatures
 src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
+src/bin/sprig-ui.rs  the desktop app (`--features ui`)
 tests/            integration tests (CLI as a subprocess, servers in-process)
 bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
@@ -430,8 +468,13 @@ Direct dependencies, each the standard crate for its job:
 | `notify` | `sprig watch` |
 | `memmap2`, `libc`, `getrandom` | mmap of packs and the index, local time, randomness |
 
-All are pinned in `Cargo.lock` (82 crates in the build, 114 counting other
-platforms). Checked before release:
+The desktop app adds `eframe` (egui, winit, glutin), only when built with
+`--features ui`; the CLI build does not include it. Its accessibility
+feature is left out because it pulls in a D-Bus stack that RustSec flags as
+unmaintained.
+
+All are pinned in `Cargo.lock` (82 crates in the CLI build, about 200 with
+the app on Linux). Checked before release:
 
 - `cargo audit` against the RustSec advisory database: no vulnerabilities,
   no unmaintained or yanked crates.
