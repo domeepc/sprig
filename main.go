@@ -73,7 +73,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   push [-f] [remote] [branch]    fetch [remote] [branch]    pull [remote] [branch]
   land -m msg [--intent s] [--check k=v]... [remote] [branch]
                                       send working-tree edits; the server rebases and lands them
-  serve [--addr host:port] [--token t] [--tokens file] [--upstream url] [dir]
+  serve [--addr host:port] [--token t] [--tokens file] [--upstream url[,url]] [--follow url] [dir]
   import-git [--force] <git-repo>     convert a git repository's branches
   export-git [--force] <git-repo>     write branches into a git repo (then git push)
   cat <id>                            print a raw object
@@ -1324,7 +1324,8 @@ func cmdServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:7700", "listen address")
 	token := fs.String("token", os.Getenv("SPRIG_TOKEN"), "require this bearer token")
 	tokens := fs.String("tokens", "", `JSON file of scoped tokens: {"<token>": ["dir", ...]}`)
-	upstream := fs.String("upstream", "", "run as a cache in front of this sprig server")
+	upstream := fs.String("upstream", "", "run as a cache in front of this sprig server (comma-separated: first that answers)")
+	follow := fs.String("follow", "", "run as a read-only standby mirroring this sprig server")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1365,6 +1366,14 @@ func cmdServe(args []string) error {
 			return errors.New("a cache needs its own bare repository (sprig init --bare cache.sprig)")
 		}
 		s.upstream = newRemote("upstream", *upstream)
+	} else {
+		r.Durable = true // the authority: acknowledged writes must survive a crash
+	}
+	if *follow != "" {
+		if !r.Bare || *upstream != "" {
+			return errors.New("--follow needs its own bare repository and no --upstream")
+		}
+		s.follow = newRemote("follow", *follow)
 	}
 	return serve(s, *addr)
 }
