@@ -102,8 +102,11 @@ size of the repository.
 
 ### Scaling out: several servers and caches
 
-The ref swap uses a file lock, so several `sprig serve` processes can share
-one repository directory (on one machine) and land concurrently.
+The ref swap uses an OS file lock (flock on Unix, LockFileEx on Windows), so
+several `sprig serve` processes can share one repository directory and land
+concurrently. A served repository is durable: object and ref writes are
+fsynced before a push or landing is acknowledged, and every ref change is
+appended to `reflog.jsonl` (time, ref, old and new id, how, by whom).
 
 A cache server keeps its own copy of objects, which never change once written,
 and passes most other requests (refs, log, files) through to the main server.
@@ -119,6 +122,22 @@ sprig serve --addr 127.0.0.1:7701 --upstream http://main-host:7700 cache.sprig
 
 Point clients at the cache. It checks tokens the same way the main server
 does (`--token`, `--tokens`) and fetches from upstream with `SPRIG_TOKEN`.
+It keeps a copy of upstream's refs current by long-polling `/v1/refs`, so a
+landing starts from the right tip without an extra round trip.
+`--upstream` takes a comma-separated list; requests go to the first server
+that answers.
+
+A standby mirrors another server read-only, following its refs as they
+change:
+
+```sh
+sprig init --bare standby.sprig
+sprig serve --addr 0.0.0.0:7700 --follow http://main-host:7700 standby.sprig
+```
+
+It serves reads and clones and refuses writes (HTTP 503). If the main server
+dies, restart the standby without `--follow` and it becomes the main server;
+caches listed with `--upstream main,standby` switch over by themselves.
 
 ### Partial clones
 
@@ -225,7 +244,7 @@ API (all paths under `/v1`, bearer token when configured):
 
 | Method | Path | Returns |
 |---|---|---|
-| GET | `/refs` | all refs |
+| GET | `/refs?wait=<etag>` | all refs and their etag; with `wait`, blocks until they differ from it (up to 25 s) |
 | GET | `/log?ref=main&limit=50` | changes with metadata |
 | GET | `/changes/{id}` | one change |
 | GET | `/file?ref=main&path=src/x.go` | file contents |
@@ -288,6 +307,9 @@ sign.go       ed25519 change signatures
 pack.go       packfiles (zstd, compact trees, deltas), gc, auto gc
 astmerge.go   Go-aware merge (go/parser)
 watch.go      `sprig watch` file watcher (fsnotify)
+follow.go     ref long-poll, caches following upstream, read-only standbys
+reflog.go     server ref log
+lock_*.go     ref lock per platform
 main.go       CLI
 ```
 
@@ -309,8 +331,8 @@ Reading from packs stays fast: `status` 4 ms, `log -n 300` 11 ms.
 - **Code-aware merge is Go only.** It uses the standard library's parser;
   other languages would need tree-sitter, a cgo dependency.
 - **One authority holds the refs.** Caches on any machine do the landing
-  work, but every ref swap goes to a single main server (Scion keeps refs in
-  Spanner). That server's own lock is a Unix file lock.
+  work and standbys mirror everything, but every ref swap goes to a single
+  main server (Scion keeps refs in Spanner). Failover to a standby is manual.
 - **Read-scoped tokens can't clone.** Objects are fetched by id alone, so
   these tokens are limited to `/file`, `/ls` and `land`. History metadata
   (`/log`, `/changes`) is visible to every token.
