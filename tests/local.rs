@@ -709,4 +709,6 @@ fn signs_with_an_ssh_key() {
     let audit = c.must(&["audit", "--signed"]);
     assert!(audit.starts_with("0 of 1"), "{audit}");
     assert!(c.must(&["log", "--signatures"]).contains("me"));
+    c.must(&["trust", "-d", public.trim()]); // the .pub line works here too
+    assert_eq!(c.must(&["trust"]), "");
 }

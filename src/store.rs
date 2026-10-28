@@ -603,6 +603,10 @@ pub fn author_from(c: &Config) -> String {
     if !c.author.is_empty() {
         return c.author.clone();
     }
+    let global = crate::sign::global_author();
+    if !global.is_empty() {
+        return global;
+    }
     let u = std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "unknown".into());
     format!("{u} <{u}@localhost>")
 }

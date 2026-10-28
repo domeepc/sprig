@@ -65,7 +65,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   undo [-f]                           undo the last operation (undo again = redo)
   audit [--require check] [--signed] [--json] [rev]   agent changes lacking a check or trusted signature
   keygen [--ssh file]                 create a signing key (or sign with an ed25519 SSH key); commits, merges and landings get signed
-  trust [<key> <name>]                list or add keys that audit --signed accepts
+  trust [<key> <name>] | trust -d <key>   list, add or remove keys that audit --signed accepts
   remote add <name> <url> | remote list
   push [-f] [remote] [branch]    fetch [remote] [branch]    pull [remote] [branch]
   land -m msg [--intent s] [--check k=v]... [remote] [branch]
@@ -998,6 +998,13 @@ fn cmd_trust(r: &Repo, args: &[String], out: Out) -> Result<()> {
             }
             Ok(())
         }
+        [d, key] if d == "-d" => {
+            let key = crate::sign::ssh_public(key).unwrap_or_else(|| key.clone());
+            if cfg.trusted.remove(&key).is_none() {
+                bail!("{key} is not trusted");
+            }
+            r.save_config(&cfg)
+        }
         [key, name] => {
             // a .pub file's "ssh-ed25519 AAAA…" line works too
             let key = &crate::sign::ssh_public(key).unwrap_or_else(|| key.clone());
@@ -1009,7 +1016,7 @@ fn cmd_trust(r: &Repo, args: &[String], out: Out) -> Result<()> {
             cfg.trusted.insert(key.clone(), name.clone());
             r.save_config(&cfg)
         }
-        _ => bail!("usage: trust [<key> <name>]"),
+        _ => bail!("usage: trust [<key> <name>] | trust -d <key>"),
     }
 }
 

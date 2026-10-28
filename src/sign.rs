@@ -179,6 +179,22 @@ pub fn key_file() -> Result<PathBuf> {
     key_path()
 }
 
+/// The author for repositories that set none: ~/.config/sprig/author, one
+/// "Name <email>" line. Empty when unset.
+pub fn global_author() -> String {
+    config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("sprig/author")).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+pub fn set_global_author(author: &str) -> Result<()> {
+    let dir = config_dir().ok_or_else(|| err!("neither $XDG_CONFIG_HOME nor $HOME are defined"))?.join("sprig");
+    std::fs::create_dir_all(&dir)?;
+    Ok(std::fs::write(dir.join("author"), format!("{author}\n"))?)
+}
+
 /// The public half of the user's signing key, if they have one.
 pub fn my_public_key() -> Result<Option<String>> {
     Ok(signing_key()?.map(|k| public_key(&k)))
