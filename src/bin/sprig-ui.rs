@@ -109,6 +109,8 @@ struct State {
     changes: Vec<FileChange>,
     conflicts: Vec<ConflictRow>,
     history: Vec<Row>,
+    /// branches that share no history with HEAD: switching swaps the whole tree
+    unrelated: Vec<String>,
     now: i64,
 }
 
@@ -243,6 +245,13 @@ fn state() -> Res<State> {
         }
         _ => None,
     };
+    let unrelated = r
+        .list_refs()
+        .iter()
+        .filter_map(|(n, id)| Some((n.strip_prefix("heads/")?, id)))
+        .filter(|(_, id)| !head.is_empty() && **id != head && r.merge_bases(&head, id).is_ok_and(|b| b.is_empty()))
+        .map(|(n, _)| n.to_string())
+        .collect();
     let home = std::env::var("HOME").unwrap_or_default();
     let root = r.root.display().to_string();
     Ok(State {
@@ -253,6 +262,7 @@ fn state() -> Res<State> {
         },
         branch,
         head,
+        unrelated,
         branches: r.list_refs().keys().filter_map(|n| n.strip_prefix("heads/")).map(String::from).collect(),
         remotes: cfg.remotes.keys().cloned().collect(),
         github: cfg.github,
@@ -374,6 +384,25 @@ fn save(path: String, text: String) -> Res<()> {
     let r = repo()?;
     recorded(&r, &path)?;
     std::fs::write(r.abs(&path), text).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct Fetched {
+    summary: String,
+    /// local branches whose GitHub branch was deleted
+    orphans: Vec<String>,
+}
+
+/// Fetches from GitHub, dropping branches deleted there; nothing without one.
+#[tauri::command(async)]
+fn fetch() -> Res<Fetched> {
+    let r = repo()?;
+    let url = r.load_config().github;
+    if url.is_empty() {
+        return Ok(Fetched { summary: String::new(), orphans: vec![] });
+    }
+    let f = r.github_fetch(&url).map_err(|e| e.to_string())?;
+    Ok(Fetched { summary: f.summary, orphans: f.orphans })
 }
 
 #[derive(Serialize)]
@@ -517,6 +546,7 @@ fn main() {
             save,
             settings,
             set_author,
+            fetch,
             setup_signing
         ])
         .run(tauri::generate_context!("ui/tauri.conf.json"))

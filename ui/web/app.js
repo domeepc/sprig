@@ -323,7 +323,8 @@ function branchMenu() {
   const names = S.branches.includes(S.branch) ? S.branches : [S.branch, ...S.branches];
   const others = S.branches.filter((b) => b !== S.branch);
   const items = names
-    .map((b) => `<button class="item${b === S.branch ? " on" : ""}" ${b === S.branch ? "" : `data-act="run" data-name="checkout ${esc(b)}" data-args='${esc(JSON.stringify(["checkout", b]))}'`}>
+    .map((b) => `<button class="item${b === S.branch ? " on" : ""}" ${b === S.branch ? "" : `data-act="run" data-name="checkout ${esc(b)}" data-args='${esc(JSON.stringify(["checkout", b]))}'`}
+      ${S.unrelated.includes(b) ? `data-confirm="${esc(`${b} shares no history with ${S.branch}: switching replaces every file in the folder with ${b}'s.`)}"` : ""}>
       ${icon("branch", 13, b === S.branch ? "#5b8def" : "#a1a1aa")}${esc(b)}${b === S.branch ? `<span class="check">${icon("check", 12)}</span>` : ""}</button>`)
     .join("");
   const create = S.head
@@ -336,7 +337,7 @@ function branchMenu() {
   const menu = V.menu
     ? `<div class="menu" role="menu"><div class="label">Switch branch</div>${items}${create}<hr>
         <div class="label">Merge into ${esc(S.branch)}</div>${merges}<hr>
-        <button class="item" data-act="refresh">${icon("refresh", 13, "#a1a1aa")}Refresh</button></div>`
+        <button class="item" data-act="refresh" title="${S.github ? "fetch from GitHub, then reload" : "reload"}">${icon("refresh", 13, "#a1a1aa")}Refresh</button></div>`
     : "";
   return `<div class="menu-wrap"><button class="chip" data-act="menu" aria-expanded="${V.menu}">${icon("branch", 12)}${esc(S.branch)}${icon("down", 12, "#8b8b93")}</button>${menu}</div>`;
 }
@@ -752,14 +753,16 @@ document.addEventListener("click", async (ev) => {
     case "who": V.who = d.who; return render();
     case "split": V.split = d.split === "1"; return render();
     case "menu": V.menu = !V.menu; return render();
-    case "refresh": V.menu = false; return refresh();
+    case "refresh": V.menu = false; return fetchAll();
     case "open": return openChange(d.id);
     case "back": V.change = null; return render();
     case "file":
       V.file = !d.path || (V.tab === "changes" && V.file === d.path) ? null : d.path; // a second click goes back to all
       return go("changes");
     case "jump": return document.querySelector(`.dfile[data-file="${CSS.escape(d.path)}"]`)?.scrollIntoView({ block: "start" });
-    case "run": return act(d.name ?? JSON.parse(d.args).join(" "), JSON.parse(d.args));
+    case "run":
+      if (d.confirm && !(await ask("Switch branch?", `<p>${esc(d.confirm)}</p>`, "Switch"))) return;
+      return act(d.name ?? JSON.parse(d.args).join(" "), JSON.parse(d.args));
     case "commit": {
       const args = ["commit", "-m", V.message.trim()];
       if (!S.changes.length) args.push("--allow-empty"); // recording a resolution that matches HEAD
@@ -928,6 +931,52 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && ev.target.id === "newbranch") document.querySelector('[data-act="branch-create"]')?.click();
   if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target.id === "msg") document.querySelector('[data-act="commit"]')?.click();
 });
+
+// ---------------------------------------------------------------------------
+// Refresh: fetch from GitHub, and offer to delete branches GitHub deleted
+
+/// A modal question; resolves to whether OK was pressed.
+function ask(title, body, ok, danger = false) {
+  const d = $("ask");
+  d.innerHTML = `<form method="dialog"><h2>${esc(title)}</h2>${body}
+    <div class="end"><button class="btn" value="no">Cancel</button>
+      <button class="btn ${danger ? "danger" : "primary"}" value="yes">${esc(ok)}</button></div></form>`;
+  d.returnValue = "";
+  d.showModal();
+  return new Promise((done) => d.addEventListener("close", () => done(d.returnValue === "yes"), { once: true }));
+}
+
+async function fetchAll() {
+  if (V.busy) return;
+  V.busy = S?.github ? "fetching from GitHub" : "refreshing";
+  render();
+  let orphans = [];
+  try {
+    const f = await invoke("fetch");
+    orphans = f.orphans;
+    if (f.summary) V.status = { ok: true, text: f.summary };
+  } catch (e) {
+    V.status = { ok: false, text: `fetch: ${e}` };
+  }
+  V.busy = "";
+  await refresh();
+  if (!orphans.length) return;
+  const list = orphans
+    .map((b) => `<label class="opt"><input type="checkbox" name="orphan" value="${esc(b)}"><span><b class="mono">${esc(b)}</b><small>deleted on GitHub</small></span></label>`)
+    .join("");
+  const yes = await ask("Delete local branches?", `<p class="muted">GitHub no longer has ${orphans.length === 1 ? "this branch" : "these branches"}. Tick the local ones to delete; their changes stay reachable with <span class="mono">sprig undo</span>.</p><div class="opts">${list}</div>`, "Delete selected", true);
+  const picked = [...$("ask").querySelectorAll('input[name="orphan"]:checked')].map((i) => i.value);
+  if (!yes || !picked.length) return;
+  for (const b of picked) {
+    try {
+      await invoke("run", { args: ["branch", "-d", b] });
+    } catch (e) {
+      V.status = { ok: false, text: `branch -d ${b}: ${e}` };
+    }
+  }
+  if (V.status.ok) V.status = { ok: true, text: `deleted ${picked.join(", ")}` };
+  await refresh();
+}
 
 // ---------------------------------------------------------------------------
 // Signing: a dialog to sign with an SSH key or a new sprig key

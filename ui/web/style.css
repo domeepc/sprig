@@ -1,6 +1,7 @@
 /* sprig-ui: the dark theme from the design canvas (Cursor's Agents tab and
    Graphite's inbox, from Mobbin). Every color, radius and size is a token. */
 :root {
+  color-scheme: dark; /* native checkboxes, radios and scrollbars draw dark */
   --bg: #0e0e10;
   --sidebar: #121214;
   --surface: #17171a;
@@ -116,6 +117,7 @@ svg { flex-shrink: 0; }
 .btn.soft:not(:disabled):hover { background: #2a2a30; }
 .btn.primary { background: var(--primary); border-color: transparent; color: #fff; font-weight: 500; }
 .btn.primary:not(:disabled):hover { background: #3a76f0; }
+.btn.danger { background: var(--del); border-color: transparent; color: #fff; font-weight: 500; }
 .btn.warn { background: var(--warn); border-color: transparent; color: #1a1406; font-weight: 600; }
 .btn.outline-warn { border-color: #5a4818; }
 input[type="text"], textarea {
@@ -196,7 +198,7 @@ input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
 .banner .text b { font-weight: 500; }
 .banner .text span { font-size: 12px; color: #c9b58a; }
 .section { border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--sidebar); overflow: hidden; }
-.section > summary > .head {
+.section > summary > .head , .section > .head {
   display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 14px; border-bottom: 1px solid var(--border);
 }
 summary { list-style: none; cursor: pointer; user-select: none; }
@@ -204,12 +206,12 @@ summary::-webkit-details-marker { display: none; }
 summary { display: block; }
 summary > div > svg:first-child { transition: transform 0.12s; }
 details:not([open]) > summary > div > svg:first-child { transform: rotate(-90deg); }
-.section:not([open]) > summary > .head, .dfile:not([open]) > summary > .fh { border-bottom: 0; }
-.section > summary > .head .count { font-size: 12px; color: var(--faint); min-width: 14px; }
-.section > summary > .head h2 { margin: 0; font-size: 13px; font-weight: 500; }
-.section > summary > .head .aside { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--faint); }
-.section > summary > .head .aside a { color: var(--faint); }
-.section > summary > .head .aside a:hover { color: var(--text); }
+details.section:not([open]) > summary > .head, .dfile:not([open]) > summary > .fh { border-bottom: 0; }
+.section > summary > .head .count , .section > .head .count { font-size: 12px; color: var(--faint); min-width: 14px; }
+.section > summary > .head h2 , .section > .head h2 { margin: 0; font-size: 13px; font-weight: 500; }
+.section > summary > .head .aside , .section > .head .aside { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--faint); }
+.section > summary > .head .aside a , .section > .head .aside a { color: var(--faint); }
+.section > summary > .head .aside a:hover , .section > .head .aside a:hover { color: var(--text); }
 .empty { padding: 12px 14px; color: var(--faint); }
 .file {
   display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 14px 0 38px; border-bottom: 1px solid var(--divider);
