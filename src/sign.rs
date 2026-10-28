@@ -63,19 +63,97 @@ fn key_path() -> Result<PathBuf> {
     Ok(config_dir().ok_or_else(|| err!("neither $XDG_CONFIG_HOME nor $HOME are defined"))?.join("sprig/signing.key"))
 }
 
-/// The user's private key, or None if they have none.
+/// The user's private key, or None if they have none. It is sprig's own
+/// (base64 seed) or an OpenSSH ed25519 key (`sprig keygen --ssh`).
 pub fn signing_key() -> Result<Option<SigningKey>> {
     let p = key_path()?;
     let b = match std::fs::read_to_string(&p) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         r => r?,
     };
+    if b.starts_with(OPENSSH) {
+        let seed = openssh_seed(&b).map_err(|e| err!("{}: {e}", p.display()))?;
+        return Ok(Some(SigningKey::from_bytes(&seed)));
+    }
     let seed: [u8; 32] = B64
         .decode(b.trim())
         .ok()
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| err!("{} is not a sprig signing key", p.display()))?;
     Ok(Some(SigningKey::from_bytes(&seed)))
+}
+
+const OPENSSH: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+
+/// Takes one length-prefixed field of OpenSSH's wire format off the front.
+fn field<'a>(r: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let n = u32::from_be_bytes(r.get(..4)?.try_into().ok()?) as usize;
+    let f = r.get(4..4 + n)?;
+    *r = &r[4 + n..];
+    Some(f)
+}
+
+/// The seed of an unencrypted ed25519 key in OpenSSH's file format (what
+/// `ssh-keygen -t ed25519` writes).
+fn openssh_seed(text: &str) -> Result<[u8; 32]> {
+    let body: String = text.lines().filter(|l| !l.starts_with("-----")).collect();
+    let bad = || err!("not an OpenSSH private key");
+    let b = B64.decode(body.trim()).map_err(|_| bad())?;
+    let mut r = b.strip_prefix(b"openssh-key-v1\0".as_slice()).ok_or_else(bad)?;
+    if field(&mut r).ok_or_else(bad)? != b"none" {
+        bail!("the key has a passphrase; sprig can only sign with an unencrypted key");
+    }
+    field(&mut r).ok_or_else(bad)?; // kdf name
+    field(&mut r).ok_or_else(bad)?; // kdf options
+    r = r.get(4..).ok_or_else(bad)?; // number of keys
+    field(&mut r).ok_or_else(bad)?; // public key
+    let mut p = field(&mut r).ok_or_else(bad)?; // private section
+    p = p.get(8..).ok_or_else(bad)?; // two check numbers
+    if field(&mut p).ok_or_else(bad)? != b"ssh-ed25519" {
+        bail!("only ed25519 SSH keys can sign changes");
+    }
+    field(&mut p).ok_or_else(bad)?; // public key again
+    let private = field(&mut p).ok_or_else(bad)?; // seed, then public key
+    private.get(..32).and_then(|s| s.try_into().ok()).ok_or_else(bad)
+}
+
+/// "ssh-ed25519 AAAA… comment" (a .pub file's line) as a sprig public key.
+pub fn ssh_public(line: &str) -> Option<String> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "ssh-ed25519" {
+        return None;
+    }
+    let b = B64.decode(parts.next()?).ok()?;
+    let mut r = b.as_slice();
+    if field(&mut r)? != b"ssh-ed25519" {
+        return None;
+    }
+    let key: [u8; 32] = field(&mut r)?.try_into().ok()?;
+    Some(format!("{KEY_PREFIX}{}", B64.encode(key)))
+}
+
+/// Signs with an SSH key from now on: the signing key path points at it.
+pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
+    let text = std::fs::read_to_string(ssh)?;
+    let key = SigningKey::from_bytes(&openssh_seed(&text).map_err(|e| err!("{}: {e}", ssh.display()))?);
+    let p = key_path()?;
+    if p.exists() {
+        bail!("{} already exists", p.display());
+    }
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let ssh = std::fs::canonicalize(ssh)?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&ssh, &p)?;
+    #[cfg(not(unix))]
+    std::fs::copy(&ssh, &p)?; // ponytail: a copy, not a link; symlinks need admin rights on Windows
+    Ok((p, public_key(&key)))
+}
+
+/// The public half of the user's signing key, if they have one.
+pub fn my_public_key() -> Result<Option<String>> {
+    Ok(signing_key()?.map(|k| public_key(&k)))
 }
 
 pub fn generate_key() -> Result<(PathBuf, String)> {

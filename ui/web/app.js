@@ -18,7 +18,6 @@ const PATHS = {
   warn: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
   undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   down: '<path d="m6 9 6 6 6-6"/>',
   left: '<path d="m15 18-6-6 6-6"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
@@ -26,7 +25,6 @@ const PATHS = {
   merge: '<circle cx="6" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><path d="M6 8v2a8 8 0 0 0 8 8h2"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
   up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
-  updown: '<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>',
   refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
 };
 const icon = (name, size = 15, color = "currentColor") =>
@@ -52,6 +50,8 @@ const V = {
   menu: false, // the branch menu is open
   busy: "", // the running command's name
   status: { ok: true, text: "" },
+  signing: null, // from `signing`: the key, whether it is trusted here, SSH keys
+  closed: new Set(), // keys of the sections and diff files folded shut
 };
 const stats = new Map(); // change id -> [add, del]
 
@@ -176,11 +176,14 @@ const counts = (a, d, sep = " ") => `<span class="add">+${a}</span>${sep}<span c
 const avatar = (name, agent) =>
   `<span class="avatar av-${hash(name) % 4}${agent ? "" : " person"}" aria-hidden="true">${esc((name[0] ?? "?").toUpperCase())}</span>`;
 const pill = (k, v) => `<span class="pill ${tone(v)}">${esc(k)}=${esc(v)}</span>`;
-const soon = 'disabled title="coming soon"';
+
+/// A collapsible card; `key` remembers whether it was closed across redraws.
+const fold = (key) => `data-key="${esc(key)}" ${V.closed.has(key) ? "" : "open"}`;
 
 function section(n, title, aside, body) {
-  return `<section class="section"><div class="head">${icon("down", 12, "#8b8b93")}<span class="count">${n}</span>
-    <h2>${esc(title)}</h2><div class="aside">${aside}</div></div>${body}</section>`;
+  const key = `s:${title.replace(/ on .*/, "")}`; // "Recent on main" keeps its state across branches
+  return `<details class="section" ${fold(key)}><summary class="head">${icon("down", 12, "#8b8b93")}<span class="count">${n}</span>
+    <h2>${esc(title)}</h2><div class="aside">${aside}</div></summary>${body}</details>`;
 }
 
 function changeRow(c) {
@@ -218,8 +221,8 @@ function fileRow(f, cls = "file") {
 
 function sidebar() {
   if (!S) return "";
-  const nav = (tab, ic, name, n, enabled = true, warn = false) =>
-    `<button class="nav${V.tab === tab ? " on" : ""}" ${enabled ? `data-act="tab" data-tab="${tab}"` : soon}>
+  const nav = (tab, ic, name, n, warn = false) =>
+    `<button class="nav${V.tab === tab ? " on" : ""}" data-act="tab" data-tab="${tab}">
       <span class="${warn ? "warn-ic" : ""}" style="display:flex">${icon(ic)}</span>${name}
       ${n ? `<span class="n${warn ? " warn" : ""}">${n}</span>` : ""}</button>`;
   const ws = workers();
@@ -238,18 +241,14 @@ function sidebar() {
     <div class="repo">
       <div class="logo">${icon("sprout", 14, "#5b8def")}</div>
       <div class="repo-name"><b>${esc(S.name)}</b><span title="${esc(S.root)}">${esc(S.root)}</span></div>
-      <button class="ghost" aria-label="Switch repository" ${soon}>${icon("updown", 14)}</button>
     </div>
     <div class="new">
       <button class="wide" data-act="tab" data-tab="changes" data-focus="msg">${icon("plus", 14)} New change<span class="kbd">${mac ? "⌘N" : "Ctrl+N"}</span></button>
-      <button class="square" aria-label="Search" ${soon}>${icon("search", 14)}</button>
     </div>
     ${nav("inbox", "inbox", "Inbox", unreviewed().length + S.conflicts.length)}
     ${nav("changes", "diff", "Changes", S.changes.length)}
     ${nav("history", "clock", "History", 0)}
-    ${nav("branches", "branch", "Branches", S.branches.length, false)}
-    ${nav("conflicts", "warn", "Conflicts", S.conflicts.length, true, S.conflicts.length > 0)}
-    ${nav("ops", "undo", "Operations", 0, false)}
+    ${nav("conflicts", "warn", "Conflicts", S.conflicts.length, S.conflicts.length > 0)}
     ${ws.length ? `<div class="label">This week</div>${people}` : ""}
     ${syncCard()}`;
 }
@@ -287,9 +286,7 @@ function header() {
   if (V.tab === "history" && V.change) {
     const c = V.detail?.row ?? S.history.find((h) => h.id === V.change);
     return `<div class="crumb"><button class="back" data-act="back">${icon("left", 14)} History</button>
-      <span style="color:#3a3a40">/</span><h1>${esc(c?.title ?? "")}</h1><span class="mono small muted">${esc(c?.short ?? "")}</span></div>
-      <div class="end"><button class="btn" ${soon}>Check out</button><button class="btn soft" ${soon}>Approve review</button>
-        <button class="btn primary" ${soon}>${icon("up", 13)} Land on main</button></div>`;
+      <span style="color:#3a3a40">/</span><h1>${esc(c?.title ?? "")}</h1><span class="mono small muted">${esc(c?.short ?? "")}</span></div>`;
   }
   const title = { inbox: "Inbox", changes: "Changes", history: "History", conflicts: "Conflicts" }[V.tab];
   const seg = ["inbox", "history"].includes(V.tab)
@@ -406,7 +403,7 @@ function changePage() {
       ? ["ok", "Signed by a trusted key", D.signature.Ok]
       : ["warn", "Signed, but not by a trusted key", D.signature.Ok]
     : D.signature.Err === "unsigned"
-      ? ["", "Unsigned", "sprig keygen signs your changes"]
+      ? ["", "Unsigned", "sign your changes with an SSH or sprig key"]
       : ["bad", "Bad signature", D.signature.Err];
   const sub = [c.model, ago(c.time, true), `on ${S.branch}`].filter(Boolean).join(" · ");
   const left = `
@@ -417,24 +414,16 @@ function changePage() {
     ${c.intent ? `<div class="group"><span class="heading">Intent</span><p class="intent">${esc(c.intent)}</p></div>` : ""}
     <div class="group"><span class="heading">Checks</span><div class="checklist">${checkRows}</div></div>
     <div class="group"><span class="heading">Signature</span>
-      <div class="sig ${sig[0]}">${icon("shield", 15)}<div><b>${esc(sig[1])}</b><span title="${esc(sig[2])}">${esc(sig[2])}</span></div></div></div>
+      <div class="sig ${sig[0]}">${icon("shield", 15)}<div><b>${esc(sig[1])}</b><span title="${esc(sig[2])}">${esc(sig[2])}</span></div>
+        ${V.signing && !V.signing.trusted ? '<button class="btn" style="margin-left:auto" data-act="keys">Set up signing</button>' : ""}</div></div>
     <div class="group"><span class="heading">Change</span><div class="facts">
       <span class="mono" style="color:var(--text)">${esc(c.short)}</span>
       <button class="btn" style="height:24px;padding:0 8px" data-act="copy" data-text="${esc(c.id)}">Copy id</button>
       ${c.parents.length > 1 ? '<span class="pill merge">merge</span>' : ""}
       ${c.parents.length ? `<span>parent ${esc(c.parents.join(", "))}</span>` : ""}
-      ${c.conflicts ? `<span class="pill pend">${plural(c.conflicts, "conflict")}</span>` : ""}</div></div>
-    <form class="composer" onsubmit="return false"><label for="follow">Ask the agent for a follow-up change</label>
-      <textarea id="follow" rows="2" placeholder="e.g. also cover this in the tests" disabled title="coming soon"></textarea>
-      <div class="foot"><span class="model">${esc(agent ? `${c.agent} ${c.model}`.trim() : "agent")}</span>
-        <button class="send" aria-label="Send" ${soon}>${icon("up", 14)}</button></div></form>`;
-  const tabs = `<div class="tabs" role="tablist" aria-label="View">
-    <button class="tab on" role="tab" aria-selected="true">Diff</button>
-    <button class="tab" role="tab" aria-selected="false" ${soon}>Files ${D.diff.length}</button>
-    <button class="tab" role="tab" aria-selected="false" ${soon}>Conflicts ${c.conflicts}</button>
-    <button class="tab" role="tab" aria-selected="false" ${soon}>Raw</button>${splitSwitch()}</div>`;
+      ${c.conflicts ? `<span class="pill pend">${plural(c.conflicts, "conflict")}</span>` : ""}</div></div>`;
   return `<div class="split-page"><aside class="left" aria-label="Provenance">${left}</aside>
-    <div class="right">${tabs}${diffView(D.diff, false)}</div></div>`;
+    <div class="right">${diffView(D.diff, false)}</div></div>`;
 }
 
 function conflictsPage() {
@@ -471,7 +460,7 @@ const MAX_LINES = 4000; // per view; a lockfile alone can be thousands
 function diffView(files, working) {
   if (!files.length) return '<div class="empty">Nothing to show</div>';
   const [a, d] = files.reduce(([a, d], f) => [a + f.add, d + f.del], [0, 0]);
-  const top = `<div class="difftop"><b>${plural(files.length, "file")} changed</b><span class="mono">${counts(a, d)}</span>${working ? splitSwitch() : ""}</div>`;
+  const top = `<div class="difftop"><b>${plural(files.length, "file")} changed</b><span class="mono">${counts(a, d)}</span>${splitSwitch()}</div>`;
   const chips = `<div class="fchips">${files.slice(0, 12)
     .map((f) => `<button class="fchip${V.file === f.path ? " on" : ""}" ${working ? `data-act="file" data-path="${esc(f.path)}"` : `data-act="jump" data-path="${esc(f.path)}"`}>
       <span>${esc(f.path)}</span>${counts(f.add, f.del)}</button>`)
@@ -489,8 +478,8 @@ function diffView(files, working) {
         budget -= h.lines.length;
         hunks += `<div class="hh">${esc(h.header)}</div>${V.split ? splitHunk(h.lines) : unifiedHunk(h.lines)}`;
       }
-      return `<div class="dfile" data-file="${esc(f.path)}"><div class="fh">${icon("down", 12, "#8b8b93")}<span class="p">${esc(f.path)}</span>
-        <span class="mono small">${counts(f.add, f.del)}</span></div>${notes}${hunks}</div>`;
+      return `<details class="dfile" data-file="${esc(f.path)}" ${fold(`f:${f.path}`)}><summary class="fh">${icon("down", 12, "#8b8b93")}<span class="p">${esc(f.path)}</span>
+        <span class="mono small">${counts(f.add, f.del)}</span></summary>${notes}${hunks}</details>`;
     })
     .join("");
   return top + chips + body;
@@ -623,9 +612,26 @@ document.addEventListener("click", async (ev) => {
       V.githubEdit = null;
       return act("github set", ["github", "set", url]);
     }
+    case "keys": return openKeys();
+    case "keys-use": return useKey();
+    case "keys-later":
+      try {
+        localStorage.setItem("sprig.keys-later", "1");
+      } catch {}
+      return $("keys").close();
     case "copy": navigator.clipboard?.writeText(d.text); V.status = { ok: true, text: "copied" }; return render();
   }
 });
+
+// Folding a section or a file; toggle doesn't bubble, so listen on the way down.
+document.addEventListener(
+  "toggle",
+  (ev) => {
+    const k = ev.target.dataset?.key;
+    if (k) ev.target.open ? V.closed.delete(k) : V.closed.add(k);
+  },
+  true,
+);
 
 // Typing keeps its text in V without redrawing, so the field keeps focus.
 document.addEventListener("input", (ev) => {
@@ -652,7 +658,60 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target.id === "msg") document.querySelector('[data-act="commit"]')?.click();
 });
 
+// ---------------------------------------------------------------------------
+// Signing: a dialog to sign with an SSH key or a new sprig key
+
+async function loadSigning() {
+  try {
+    V.signing = await invoke("signing");
+  } catch {
+    V.signing = null;
+  }
+}
+
+function openKeys(error = "") {
+  const k = V.signing;
+  if (!k) return;
+  const keys = k.ssh
+    .map(([path, comment], i) => `<label class="opt"><input type="radio" name="key" value="${esc(path)}" ${i === 0 ? "checked" : ""}>
+      <span><b class="mono">${esc(path.replace(/^.*\//, ""))}</b><small>${esc(comment || path)}</small></span></label>`)
+    .join("");
+  const mine = k.key
+    ? `<p class="muted">You sign with <span class="mono">${esc(k.key.slice(0, 24))}…</span>; this repository doesn't trust it yet.</p>`
+    : `<div class="opts">${keys}<label class="opt"><input type="radio" name="key" value="" ${k.ssh.length ? "" : "checked"}>
+        <span><b>Create a new sprig key</b><small>sprig keygen</small></span></label></div>`;
+  $("keys").innerHTML = `<form method="dialog">
+    <h2>${icon("shield", 16, "#3fb950")} Sign your changes</h2>
+    <p class="muted">Signed changes show who really made them, and <span class="mono">sprig audit --signed</span> checks them.
+      ${k.key ? "" : "An ed25519 SSH key without a passphrase works as is."}</p>
+    ${mine}${error ? `<p class="err">${esc(error)}</p>` : ""}
+    <div class="end"><button class="btn" value="cancel" data-act="keys-later">Not now</button>
+      <button class="btn primary" data-act="keys-use">${k.key ? "Trust my key here" : "Use this key"}</button></div></form>`;
+  if (!$("keys").open) $("keys").showModal();
+}
+
+async function useKey() {
+  const picked = document.querySelector('#keys input[name="key"]:checked');
+  try {
+    const key = await invoke("setup_signing", { ssh: picked?.value || null });
+    $("keys").close();
+    V.status = { ok: true, text: `signing with ${key}` };
+    await loadSigning();
+    if (V.change) await openChange(V.change);
+    render();
+  } catch (e) {
+    openKeys(String(e));
+  }
+}
+
 // Files may have changed while the window was in the back.
 window.addEventListener("focus", () => V.busy || refresh());
 
-refresh();
+refresh().then(loadSigning).then(() => {
+  let later = false;
+  try {
+    later = localStorage.getItem("sprig.keys-later") === "1";
+  } catch {}
+  if (S && V.signing && !V.signing.key && !later) openKeys();
+  render();
+});

@@ -282,7 +282,9 @@ check out everything.
 
 ```sh
 sprig keygen                       # writes ~/.config/sprig/signing.key (or $SPRIG_KEY)
+sprig keygen --ssh ~/.ssh/id_ed25519   # or sign with your SSH key (ed25519, no passphrase)
 sprig trust ed25519:AbC... alice   # keys audit --signed accepts
+sprig trust "$(cat ~/.ssh/id_ed25519.pub)" alice   # a .pub line works too
 sprig audit --signed --require review
 ```
 

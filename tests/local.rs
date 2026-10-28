@@ -684,3 +684,29 @@ fn bare_repo_has_no_working_tree() {
     let r = Repo::init(&d, true, "main").unwrap();
     assert!(r.work_status(false).is_err());
 }
+
+#[test]
+fn signs_with_an_ssh_key() {
+    if std::process::Command::new("ssh-keygen").arg("-?").output().is_err() {
+        return;
+    }
+    let mut c = Ctx::new();
+    let dir = c.temp();
+    let ssh = dir.join("id_ed25519");
+    let st = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "me@example.com", "-f"])
+        .arg(&ssh)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    c.setenv("SPRIG_KEY", dir.join("signing.key").to_str().unwrap());
+    let out = c.must(&["keygen", "--ssh", ssh.to_str().unwrap()]);
+    let public = std::fs::read_to_string(dir.join("id_ed25519.pub")).unwrap();
+    c.must(&["trust", public.trim(), "me"]); // the .pub line, converted
+    assert!(out.contains(&c.must(&["trust"]).split('\t').nth(1).unwrap().trim().to_string()), "{out}");
+    c.write("a.txt", "x\n");
+    c.must(&["commit", "-m", "signed by ssh", "--agent", "bot", "--check", "review=pass"]);
+    let audit = c.must(&["audit", "--signed"]);
+    assert!(audit.starts_with("0 of 1"), "{audit}");
+    assert!(c.must(&["log", "--signatures"]).contains("me"));
+}

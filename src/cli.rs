@@ -64,7 +64,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   ops                                 operation log
   undo [-f]                           undo the last operation (undo again = redo)
   audit [--require check] [--signed] [--json] [rev]   agent changes lacking a check or trusted signature
-  keygen                              create a signing key; commits, merges and landings get signed
+  keygen [--ssh file]                 create a signing key (or sign with an ed25519 SSH key); commits, merges and landings get signed
   trust [<key> <name>]                list or add keys that audit --signed accepts
   remote add <name> <url> | remote list
   push [-f] [remote] [branch]    fetch [remote] [branch]    pull [remote] [branch]
@@ -251,7 +251,11 @@ pub fn run(cmd: &str, args: &[String], out: Out) -> Result<()> {
         "init" => return cmd_init(args, out),
         "serve" => return cmd_serve(args, out),
         "keygen" => {
-            let (path, key) = crate::sign::generate_key()?;
+            let (path, key) = match args {
+                [] => crate::sign::generate_key()?,
+                [f, file] if f == "--ssh" => crate::sign::link_ssh_key(std::path::Path::new(file))?,
+                _ => bail!("usage: keygen [--ssh <ssh-ed25519 private key file>]"),
+            };
             writeln!(
                 out,
                 "wrote {}\npublic key: {key}\nyour changes are now signed; others can trust you with `sprig trust {key} <name>`",
@@ -995,6 +999,8 @@ fn cmd_trust(r: &Repo, args: &[String], out: Out) -> Result<()> {
             Ok(())
         }
         [key, name] => {
+            // a .pub file's "ssh-ed25519 AAAA…" line works too
+            let key = &crate::sign::ssh_public(key).unwrap_or_else(|| key.clone());
             if check_sig(&Signature { key: key.clone(), ..Default::default() }, &[])
                 .is_err_and(|e| e.to_string() == "malformed key")
             {

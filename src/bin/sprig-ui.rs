@@ -347,6 +347,54 @@ fn save(path: String, text: String) -> Res<()> {
     std::fs::write(r.abs(&path), text).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+struct Signing {
+    /// the public half of the signing key, if there is one
+    key: Option<String>,
+    /// whether this repository trusts it
+    trusted: bool,
+    /// ed25519 SSH keys that could sign instead: (private key path, its .pub line's comment)
+    ssh: Vec<(String, String)>,
+}
+
+#[tauri::command(async)]
+fn signing() -> Res<Signing> {
+    let r = repo()?;
+    let key = sprig::sign::my_public_key().map_err(|e| e.to_string())?;
+    let trusted = key.as_ref().is_some_and(|k| r.load_config().trusted.contains_key(k));
+    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".ssh");
+    let mut ssh = vec![];
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        let Some(private) = p.to_str().and_then(|s| s.strip_suffix(".pub")) else { continue };
+        let line = std::fs::read_to_string(&p).unwrap_or_default();
+        if sprig::sign::ssh_public(&line).is_some() && std::path::Path::new(private).exists() {
+            ssh.push((private.to_string(), line.split_whitespace().nth(2).unwrap_or("").to_string()));
+        }
+    }
+    ssh.sort();
+    Ok(Signing { key, trusted, ssh })
+}
+
+/// Signs with the given SSH key, or a new sprig key when there is none, and
+/// trusts that key in this repository so its changes verify.
+#[tauri::command(async)]
+fn setup_signing(ssh: Option<String>) -> Res<String> {
+    let r = repo()?;
+    let e = |e: Error| e.to_string();
+    let key = match (sprig::sign::my_public_key().map_err(e)?, ssh) {
+        (Some(k), _) => k, // already signing: only trust it here
+        (None, Some(p)) => sprig::sign::link_ssh_key(std::path::Path::new(&p)).map_err(e)?.1,
+        (None, None) => sprig::sign::generate_key().map_err(e)?.1,
+    };
+    let mut cfg = r.load_config();
+    let name = cfg.author.split(" <").next().filter(|n| !n.is_empty()).map(String::from);
+    let name = name.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "me".into());
+    cfg.trusted.insert(key.clone(), name);
+    r.save_config(&cfg).map_err(e)?;
+    Ok(key)
+}
+
 fn main() {
     let dir = std::env::args().nth(1).map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
     // the commands find the repository from the current directory, as the CLI does
@@ -356,7 +404,17 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Cache::default())
-        .invoke_handler(tauri::generate_handler![state, working_diff, change, stats, run, conflict, save])
+        .invoke_handler(tauri::generate_handler![
+            state,
+            working_diff,
+            change,
+            stats,
+            run,
+            conflict,
+            save,
+            signing,
+            setup_signing
+        ])
         .run(tauri::generate_context!("ui/tauri.conf.json"))
         .expect("sprig-ui failed to start");
 }

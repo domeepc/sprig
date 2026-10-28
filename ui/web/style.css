@@ -76,10 +76,6 @@ svg { flex-shrink: 0; }
 }
 .new .wide:hover { background: var(--raised); }
 .kbd { margin-left: auto; color: var(--faint); font: 11px var(--mono); }
-.square {
-  width: 34px; height: 34px; background: var(--surface); color: var(--muted); border: 1px solid var(--border);
-  border-radius: 7px; display: flex; align-items: center; justify-content: center;
-}
 .nav {
   display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border-radius: var(--r);
   color: var(--text-2); background: transparent; border: 0; width: 100%; text-align: left;
@@ -203,6 +199,11 @@ input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
 .section > .head {
   display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 14px; border-bottom: 1px solid var(--border);
 }
+summary { list-style: none; cursor: pointer; user-select: none; }
+summary::-webkit-details-marker { display: none; }
+summary > svg:first-child { transition: transform 0.12s; }
+details:not([open]) > summary > svg:first-child { transform: rotate(-90deg); }
+.section:not([open]) > .head, .dfile:not([open]) > .fh { border-bottom: 0; }
 .section > .head .count { font-size: 12px; color: var(--faint); min-width: 14px; }
 .section > .head h2 { margin: 0; font-size: 13px; font-weight: 500; }
 .section > .head .aside { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--faint); }
@@ -289,18 +290,7 @@ input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
 .sig b { font-weight: 500; }
 .sig span { font: 12px var(--mono); opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: var(--faint); }
-.composer { margin-top: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
-.composer label { font-size: 12px; color: var(--faint); }
-.composer textarea { resize: none; background: transparent; border: 0; padding: 0; }
-.composer .foot { display: flex; align-items: center; gap: 8px; }
-.composer .model { font-size: 12px; color: var(--muted); padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--r); }
-.send { margin-left: auto; width: 30px; height: 30px; border-radius: 50%; border: 0; background: var(--text); color: var(--bg); display: flex; align-items: center; justify-content: center; }
-
 /* ---- diff ---- */
-.tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.tab { height: 28px; padding: 0 12px; border: 0; border-radius: var(--r); background: transparent; color: var(--muted); }
-.tab.on { background: var(--raised); color: var(--text); }
-.tabs .seg { margin-left: auto; }
 .difftop { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .difftop b { font-weight: 600; }
 .difftop .seg { margin-left: auto; }
@@ -344,6 +334,23 @@ input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
 .side .box .fh { display: flex; gap: 8px; align-items: baseline; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
 .side pre { margin: 0; padding: 10px 12px; font: 12.5px/20px var(--mono); max-height: 240px; overflow: auto; }
 .editor { width: 100%; min-height: 280px; font: 12.5px/20px var(--mono); resize: vertical; }
+
+/* ---- signing dialog ---- */
+dialog {
+  width: min(460px, calc(100vw - 32px)); padding: 20px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); color: var(--text); box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+dialog h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+dialog p { margin: 0 0 14px; }
+dialog .err { color: var(--del); }
+dialog .end { display: flex; justify-content: flex-end; gap: 8px; }
+.opts { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.opt { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-lg); cursor: pointer; background: var(--bg); }
+.opt:has(input:checked) { border-color: var(--selected-border); background: var(--selected); }
+.opt input { accent-color: var(--accent); margin: 0; }
+.opt span { display: flex; flex-direction: column; min-width: 0; }
+.opt small { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- status bar ---- */
 #status {
