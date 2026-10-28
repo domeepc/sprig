@@ -1,25 +1,24 @@
 # sprig
 
 A small version control system built for a world where most commits come
-from agents. It is a hybrid: the storage is content-addressed and
-distributed like git, and a server exposes the repository as an API so
-always-online tools can ask questions without cloning.
+from agents. Storage is content-addressed and distributed like git; a server
+exposes the repository as an API, so always-online tools can ask questions
+without cloning; and it lives happily next to git: a `.git` in the same
+folder is kept in step, and GitHub is one `sprig github push` away.
 
-Prototype, about 8,900 lines of Rust plus 1,800 of tests. It was first
-written in Go; the Rust version reads and writes the same repositories,
-packs and wire protocol (byte for byte: importing the same git history gives
-the same change ids). Dependencies are pinned in `Cargo.lock` and were
-checked with `cargo audit` (see [Dependencies](#dependencies)).
+Prototype: about 10,300 lines of Rust, 2,100 of tests and a 1,600-line
+desktop app page. It was first written in Go; the Rust version reads and
+writes the same repositories, packs and wire protocol (importing the same
+git history gives the same change ids, byte for byte).
+
+- [Install](#install) · [Desktop app](#desktop-app) · [What's different from git](#whats-different-from-git) · [Quick tour](#quick-tour)
+- [Working with git and GitHub](#working-with-git-and-github) · [Server and remotes](#server-and-remotes) · [Environment](#environment) · [Layout](#layout) · [Measured](#measured)
 
 ## Install
 
-You need:
-
-- **Rust 1.89 or newer** (`rustc --version`), from rustup.rs or your
-  package manager.
-- **A C compiler** (gcc or clang). The tree-sitter grammars and zstd are C
-  and are compiled by cargo.
-- **git**, only for `import-git`/`export-git` and for fetching the source.
+You need **Rust 1.89 or newer** (1.90 for the desktop app), **a C compiler**
+(the tree-sitter grammars and zstd are C) and **git** (for GitHub sync,
+`import-git`/`export-git` and fetching the source).
 
 | System | Command |
 |---|---|
@@ -29,16 +28,15 @@ You need:
 | macOS | `xcode-select --install` (clang and git), then `brew install rust` |
 | Windows | Rust from rustup.rs with the MSVC build tools. Untested; `sprig watch` is Unix only. |
 
-Build and put it on your PATH:
-
 ```sh
-git clone https://github.com/domeepc/sprig.git
-cd sprig
-cargo install --locked --path .    # installs to ~/.cargo/bin
-sprig version
+git clone https://github.com/domeepc/sprig.git && cd sprig
+cargo install --locked --path .                 # sprig, into ~/.cargo/bin
+cargo install --locked --path . --features ui   # sprig and the desktop app, sprig-ui
+cargo test --release                            # check the build
 ```
 
-Tab completion of commands, flags, branches, remotes and conflicted paths:
+Tab completion of commands, flags, branches, remotes, conflicted paths and
+trusted keys (the scripts ask `sprig __complete`, so they never go stale):
 
 ```sh
 echo 'eval "$(sprig completion bash)"' >> ~/.bashrc
@@ -46,111 +44,70 @@ echo 'source <(sprig completion zsh)' >> ~/.zshrc      # after compinit
 sprig completion fish > ~/.config/fish/completions/sprig.fish
 ```
 
-The scripts are a few lines that ask `sprig __complete` what fits, so
-completion knows your branches and remotes and never goes out of date.
+Then, once:
 
-`~/.cargo/bin` must be on your PATH (rustup sets that up). To build without
-installing: `cargo build --release`, which leaves the binary in
-`target/release/sprig`.
-
-Check the build with `cargo test --release`.
-
-Optional setup:
-
-- `sprig keygen`: sign your changes (key in `~/.config/sprig/`).
-- `SPRIG_AUTHOR="Name <email>"`: author for your changes (see
-  [Environment](#environment)).
+- **Who you are:** set it in the app's Settings, or put `Name <email>` in
+  `~/.config/sprig/author` (all repositories; a repository's own setting and
+  `SPRIG_AUTHOR` win over it).
+- **Signing:** `sprig keygen --ssh ~/.ssh/id_ed25519` signs your changes with
+  your SSH key (ed25519, no passphrase), or `sprig keygen` makes a sprig key.
 - `sprig watch` in a repo you work in a lot keeps `status` fast.
-- Running a server: see `sprig serve` under [Quick tour](#quick-tour).
 
-To update: `git pull && cargo install --locked --path .`.
-To uninstall: `cargo uninstall sprig`, and delete `~/.config/sprig` if you made a key.
+Update with `git pull && cargo install --locked --path .`; uninstall with
+`cargo uninstall sprig` (and delete `~/.config/sprig`).
 
 ## Desktop app
 
-`sprig-ui` is a desktop window on a repository (Rust and Tauri: the page is
-plain HTML, CSS and JavaScript in `ui/web`, no npm), for Linux,
-macOS and Windows:
-
-- **Inbox**: what needs you, in sections: conflicts HEAD recorded, the
-  working tree with +N −N per file, agent changes without a passing
-  `review` check (what `sprig audit` reports), and recent changes. Filter
-  by All, Agents or People.
-- **Sidebar**: branch switcher, the pages, who made changes this week
-  (agents and people), and the GitHub card with how far the branch is
-  ahead of or behind GitHub, Pull and Push.
-- **Changes**: the working tree against HEAD and a diff with line numbers
-  (unified or side by side); commit everything or the selected file.
-- **History** and a page per change: its provenance (agent, model,
-  intent, checks, signature, parents, recorded conflicts) beside its diff.
-- **Merge** another branch from the header; pull and push with sprig
-  servers (`sprig remote add`), and with GitHub or any git host: enter the
-  repository URL once, then Pull (fetch and merge) and Push. git does the
-  network part with your own credentials (SSH key or credential helper).
-- **Conflicts**: ours, base and theirs side by side; take one side, or edit
-  the result and save it, then commit.
-- **Undo** of the last operation (again = redo).
-
-Each button runs the same code as the matching command (`checkout`,
-`merge`, `pull`, `github pull`...), so the app and the CLI behave the same
-and everything lands in `sprig ops`.
+`sprig-ui` is a window on a repository for Linux, macOS and Windows: Rust
+commands over the same code the CLI runs, and a page of plain HTML, CSS and
+JavaScript (`ui/web`, no npm) drawn in the system webview. Every button runs
+the matching command, so the app and the CLI behave the same and everything
+lands in `sprig ops`.
 
 ```sh
-cargo install --locked --path . --features ui   # installs sprig and sprig-ui
-sprig-ui path/to/repo                           # or run it inside the repo
+sprig-ui path/to/repo     # or run it inside the repo
 ```
 
-Building the app needs Rust 1.90 (the CLI alone needs 1.89). It draws in
-the system webview: WebKit on macOS, WebView2 on Windows (preinstalled on
-Windows 10 and 11), WebKitGTK on Linux (`sudo dnf install webkit2gtk4.1-devel
-libsoup3-devel` or `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev`).
+<!-- screenshot: docs/app-inbox.png (Inbox) -->
+<!-- screenshot: docs/app-change.png (a change: provenance beside its diff) -->
+<!-- screenshot: docs/app-merge.png (merge editor: ours | result | theirs) -->
+<!-- screenshot: docs/app-settings.png (Settings: identity, signing keys) -->
 
-The screenshots below are of the earlier egui version.
+- **Inbox:** what needs you. Conflicts HEAD recorded, the working tree with
+  +N −N per file, agent changes without a passing `review` check (what
+  `sprig audit` reports) and recent changes; filter by All, Agents or People.
+- **Changes:** tick the files to commit, write the message, commit; the diff
+  beside them is unified or side by side.
+- **History:** every change; each opens as a page with its provenance
+  (agent, model, intent, checks, signature, parents, conflicts) beside its diff.
+- **Conflicts:** the files a merge left, what each side did and whether
+  they are resolved; accept ours or theirs for several at once, or open the
+  merge editor: ours, result and theirs side by side, with » Ours, Both and
+  Theirs « on each conflict, or edit the result by hand.
+- **Settings:** commit name and email (this repository or all), the signing
+  key (any of your `~/.ssh` ed25519 keys, or a new one) and the keys this
+  repository trusts. Without a signing key the app offers to set one up.
+- **Branches and sync:** the branch menu switches (asking first when the
+  other branch shares no history), creates and merges branches. Refresh
+  fetches from GitHub and offers to delete local branches whose GitHub
+  branch is gone. The sidebar shows who worked this week and how far the
+  branch is ahead of or behind GitHub, with Pull and Push.
 
-![working changes](docs/ui-changes.png)
+Linux needs WebKitGTK to build it: `sudo dnf install webkit2gtk4.1-devel
+libsoup3-devel` or `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev`
+(macOS and Windows 10/11 ship their webview).
 
-![history, side-by-side diff](docs/ui-history.png)
-
-![resolving a conflict](docs/ui-conflict.png)
-
-#### Design
-
-The design system lives in one place, `ui/web/style.css`: color, radius
-and type tokens on `:root`, plus a few components (section, primary
-button, pill, badge, +N −N counts, banner, list row). The patterns come from
-source-control screens on [Mobbin](https://mobbin.com):
+The look follows Cursor's Agents tab and Graphite's inbox; colors, radii and
+type are tokens on `:root` in `ui/web/style.css`. References, from
+[Mobbin](https://mobbin.com):
 
 | Pattern | Taken from |
 |---|---|
-| Dark theme: near-black neutral canvas, bordered cards, blue "Publish" primary button, green/red +N −N | Graphite PR inbox and PR page, re-tinted for dark ([1](https://mobbin.com/screens/3e2205a5-5840-410b-abb3-38ea45add32a), [2](https://mobbin.com/screens/24233aed-0981-4a40-a745-451ee3416edc), [3](https://mobbin.com/screens/743e36e2-c364-4d55-b1d5-5e326efcecfe)) |
-| Bordered cards, blue selection; history rows with a title and an "author · sha · time" line | GitHub commit list and compare ([1](https://mobbin.com/screens/74b0d6a5-8630-4cea-9a70-d7a3338e802d), [2](https://mobbin.com/screens/13c9c426-fbb5-4b38-be81-d2a88cd89fdc), [3](https://mobbin.com/screens/6da8411f-4296-446a-ab95-e57456a48714)) |
-| Diff with line-number gutters, tinted added and removed lines, "+23 −0" per file, Unified/Split switch | GitLab commit diff ([1](https://mobbin.com/screens/95e376da-81cd-465c-a99b-a0051f9a2baf), [2](https://mobbin.com/screens/5dc51455-c50f-403e-a5bf-ca8e432784b4)), GitHub compare ([3](https://mobbin.com/screens/168fa0b6-a33c-4172-8fe0-984ecc63db45)) |
 | Sidebar with the repository, pages and who is working; a change page with provenance beside the diff | Cursor Agents tab ([1](https://mobbin.com/screens/58450174-4034-4e5d-a126-9def2378b0a0), [2](https://mobbin.com/screens/44239877-86ce-46c8-a615-273ec82046f5), [3](https://mobbin.com/screens/facfdb37-d755-40d8-b4c9-40f630d826f3)) |
-| Inbox of collapsible sections with a count, rows with avatar, title, checks, +N −N and age | Graphite inbox ([1](https://mobbin.com/screens/a83d8ccd-c487-4e28-8edc-967742f33219), [2](https://mobbin.com/screens/dad262d6-6b54-4c72-989d-8390413a2d6a)) |
-| Segmented Changes / History / Conflicts switch, file rows with +N −N | Cursor Git panel ([1](https://mobbin.com/screens/d744068a-1835-4c35-afa2-e560ccbe565d), [2](https://mobbin.com/screens/cb7068e4-44d5-4f04-9c5c-855782a96309), [3](https://mobbin.com/screens/bc80d597-15fe-4a3d-b09f-7bb7fda745b3)) |
-| AI-review layout: file list with counts beside a split diff | Mobbin has no CodeRabbit screens; the closest AI review tools stood in: Devin ([1](https://mobbin.com/screens/aeaed0d8-a1c1-4094-8615-c34f45cc7c45)), Graphite ([2](https://mobbin.com/screens/8dbeb6a4-fddd-4e76-ad84-8590cb61f8b7)), Replit ([3](https://mobbin.com/screens/e92dd0ec-6660-4610-930a-38900c351734)) |
-| Conflicts: a warning strip, sides as columns with one "keep this side" button each | Front merge review ([1](https://mobbin.com/screens/0ecf2195-42d2-4db8-a7c4-46a176759c17)), Codecademy compare ([2](https://mobbin.com/screens/3db54285-08df-44c3-a226-cf3e168b5e85)) |
-
-The same GitHub sync works from the command line: `sprig github set <url>`,
-then `sprig github fetch` (GitHub's branches arrive as `git/<branch>`; ones
-deleted there are dropped, and local branches of the same name are listed,
-never deleted), `sprig github pull` (fetch, then merge `git/<branch>`) and
-`sprig github push` (it keeps a bare mirror in
-`.sprig/github.git` and uses `import-git`/`export-git`, described below).
-SSH URLs (`git@github.com:you/repo.git`) use your ssh-agent and keys as
-plain git does; `sprig github key ~/.ssh/deploy_key` picks one key (a
-deploy key, say) for this repository, `sprig github key ''` drops it.
-
-### A working tree that also has a .git
-
-When the working tree has a `.git` folder next to `.sprig`, sprig keeps it in
-step: after every command that moves a branch or HEAD (commit, merge,
-checkout, branch, undo, pull...), the same branches, HEAD and index appear
-in git, so `git log`, `git status` and editors agree with sprig. Each commit
-is written as its changes against its parent, so this costs tens of
-milliseconds, not a re-export. A branch that git alone moved (a plain `git
-commit`) is never overwritten; sprig says so and leaves it. `.sprig/` is
-added to `.git/info/exclude`.
+| Inbox of collapsible sections with a count; rows with avatar, title, checks, +N −N and age; dark canvas, bordered cards, blue primary | Graphite inbox and PR page ([1](https://mobbin.com/screens/a83d8ccd-c487-4e28-8edc-967742f33219), [2](https://mobbin.com/screens/3e2205a5-5840-410b-abb3-38ea45add32a), [3](https://mobbin.com/screens/24233aed-0981-4a40-a745-451ee3416edc)) |
+| Diff with line-number gutters, tinted lines, +N −N per file, Unified/Split | GitLab commit diff ([1](https://mobbin.com/screens/95e376da-81cd-465c-a99b-a0051f9a2baf)), GitHub compare ([2](https://mobbin.com/screens/168fa0b6-a33c-4172-8fe0-984ecc63db45)), Neon ([3](https://mobbin.com/screens/9cb22cfd-3f04-4161-94b9-729266bc97b0)) |
+| Merge editor: ours, result, theirs with per-conflict accept buttons | IntelliJ's merge tool (not on Mobbin); split-diff styling from Cofounder ([1](https://mobbin.com/screens/c50251b3-860c-4f81-be1d-2795eae0182b)) |
+| Signing keys as a table with Default / Trusted tags | Proton keys ([1](https://mobbin.com/screens/2ee09018-18d6-4e41-8def-c7d484d9d33d)), Render and Railway settings ([2](https://mobbin.com/screens/c8aa0a45-8741-4ab9-a7c0-da832878df37), [3](https://mobbin.com/screens/1442266b-fb02-40ad-b031-030adcabe16e)) |
 
 ## What's different from git
 
@@ -192,19 +149,6 @@ sprig commit -m "one fix" --hunk main.go:2     # commit just that hunk
 sprig gc [--repack]                            # pack objects, deltas between versions
 sprig watch &                                  # optional: status re-checks only changed files
 ```
-
-### Importing from git
-
-```sh
-mkdir myproject-sprig && cd myproject-sprig
-sprig init
-sprig import-git ../myproject
-```
-
-All local branches are converted, with authors, timestamps, messages,
-merge structure, symlinks and exec bits kept; the original commit SHA is stored
-in `meta.git_sha`. Import is deterministic, so re-running it reproduces the
-same ids. Submodules are skipped with a note.
 
 ### Landing (server-side commit)
 
@@ -341,36 +285,56 @@ and answers with the projected result. The mapping is stored under
 `projected_from` (the real id) and no signature; verify signatures on the
 server.
 
-### Pushing to GitHub (or any git host)
+## Working with git and GitHub
 
-sprig has no git protocol of its own; it writes into a local git clone and
-git does the pushing. A bare clone works best, since nothing is checked out
-there to go stale.
+sprig speaks no git protocol; git does the network part, with your own
+credentials (SSH keys, ssh-agent, credential helpers).
+
+### GitHub
 
 ```sh
-git clone --bare https://github.com/you/proj proj.git
-mkdir proj && cd proj && sprig init
-sprig import-git ../proj.git
-...work, commit...
-sprig export-git ../proj.git
-git -C ../proj.git push origin main
-
-# later, bring in commits others pushed
-git -C ../proj.git fetch origin '+refs/heads/*:refs/heads/*'
-sprig import-git ../proj.git     # fast-forwards your branches
+sprig github set git@github.com:you/repo.git   # once per repository
+sprig github key ~/.ssh/deploy_key             # optional: one key for it ('' drops it)
+sprig github fetch    # GitHub's branches arrive as git/<branch>
+sprig github pull     # fetch, then merge git/<branch> into the current branch
+sprig github push     # export the current branch and push it
 ```
 
-If both sides moved a branch, `import-git` keeps git's version as
-`git/<branch>`; run `sprig merge git/<branch>` and export again.
+sprig keeps a bare mirror in `.sprig/github.git`. `fetch` never creates
+local branches; branches deleted on GitHub are dropped from `git/…`, and
+local branches of the same name are listed (the app asks whether to
+delete them). A branch whose tip has unresolved conflicts is not pushed:
+resolve and commit first.
 
-Imported history keeps its original git commits, so pushes fast-forward on
-GitHub. New changes become commits with `Sprig-Intent`/`Sprig-Agent`/
+### A .git in the same folder
+
+When the working tree has a `.git` next to `.sprig`, sprig keeps it in step:
+after every command that moves a branch or HEAD (commit, merge, checkout,
+branch, undo, pull...), the same branches, HEAD and index appear in git, so
+`git log`, `git status` and editors agree with sprig. Each commit is written
+as its changes against its parent, so this costs tens of milliseconds. A
+branch that git alone moved (a plain `git commit`) is never overwritten;
+sprig says so and leaves it. `.sprig/` goes into `.git/info/exclude`.
+
+### Any git repository
+
+```sh
+mkdir proj && cd proj && sprig init
+sprig import-git ../proj.git     # all local branches, with authors, dates, merges
+...work, commit...
+sprig export-git ../proj.git     # then git push from there
+```
+
+Import keeps each commit's sha in `meta.git_sha` and is deterministic, so
+re-importing gives the same ids; submodules are skipped with a note. If both
+sides moved a branch, `import-git` keeps git's version as `git/<branch>` to
+merge. New changes export as commits with `Sprig-Intent`/`Sprig-Agent`/
 `Sprig-Model`/`Sprig-Check` trailers and a `Sprig-Change` id, which
-`import-git` maps back to the same change instead of duplicating it. Export is
-deterministic, branch updates must fast-forward, and tips with unresolved
-conflicts are skipped (`--force` overrides both).
+`import-git` maps back instead of duplicating. Export is deterministic,
+branch updates must fast-forward, and tips with unresolved conflicts are
+skipped (`--force` overrides both).
 
-### Server and remotes
+## Server and remotes
 
 ```sh
 sprig init --bare repo.sprig
@@ -384,8 +348,8 @@ sprig pull            # fetch + merge (fast-forwards when possible)
 ```
 
 The server won't listen on a non-loopback address without a token (or
-`--tokens`). Remotes must be sprig servers; a GitHub URL is refused with a
-pointer to `export-git` (see above).
+`--tokens`). Remotes must be sprig servers; for GitHub use
+[`sprig github`](#github).
 
 API (all paths under `/v1`, bearer token when configured):
 
@@ -438,7 +402,7 @@ overflow, `.sprigignore` changed), sprig falls back to the full walk. Set
 
 | Variable | Used for |
 |---|---|
-| `SPRIG_AUTHOR` | `Name <email>` on your changes (default: your login `@localhost`) |
+| `SPRIG_AUTHOR` | `Name <email>` on your changes; wins over the repository's author and `~/.config/sprig/author` (default: your login `@localhost`) |
 | `SPRIG_AGENT`, `SPRIG_MODEL` | default `--agent` / `--model` for commit and land |
 | `SPRIG_TOKEN` | bearer token for `serve` and for clients; a cache uses it to reach upstream |
 | `SPRIG_KEY` | signing key file (default `~/.config/sprig/signing.key`) |
@@ -458,13 +422,14 @@ src/codemerge.rs  code-aware merge with tree-sitter (Go, Python, JS/TS, Rust, Ja
 src/server.rs     HTTP API, landing, scoped tokens, cache tier, standbys, reflog
 src/remote.rs     client: batched object transfer, push, fetch, land
 src/project.rs    projected history for read-scoped tokens
-src/git.rs        git import (`git cat-file --batch`) and export (`git fast-import`)
-src/sign.rs       ed25519 change signatures
+src/git.rs        git import and export, GitHub sync, keeping a working tree's .git in step
+src/sign.rs       ed25519 change signatures, SSH keys, the default author
 src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
 src/complete.rs   shell completion (bash, zsh, fish)
-src/bin/sprig-ui.rs  the desktop app's commands (`--features ui`); its page is in ui/web
+src/bin/sprig-ui.rs  the desktop app's commands (`--features ui`)
+ui/               the desktop app's page (web/), Tauri config, icon
 tests/            integration tests (CLI as a subprocess, servers in-process)
 bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
@@ -568,3 +533,8 @@ Re-check after changing dependencies with `cargo install cargo-audit` and
 - **Rename detection has limits.** Beyond 2,000 added x 2,000 deleted files
   only exact renames are found; a file renamed differently on both sides of a
   merge is left as two files rather than reported as a conflict.
+- **No pull requests.** `sprig github push` pushes a branch; open the pull
+  request on GitHub or with `gh pr create`.
+- **SSH keys with a passphrase can't sign.** sprig reads the key file
+  itself and does not talk to ssh-agent yet; use an unencrypted ed25519
+  key or a sprig key.
