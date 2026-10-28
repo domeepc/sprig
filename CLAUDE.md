@@ -8,7 +8,8 @@ sprig is a prototype version control system for agent-authored commits: content-
 
 ```sh
 cargo build --release                 # CLI only -> target/release/sprig
-cargo build --release --features ui   # also the desktop app, sprig-ui (eframe/egui)
+cargo build --release --features ui   # also the desktop app, sprig-ui (Tauri; needs Rust 1.90)
+cargo test --release --features ui --bin sprig-ui   # the app's diff-parser test
 cargo test --release                  # full suite (what the README tells users to run)
 cargo test --test github              # one integration test file (tests/github.rs, local.rs, remote.rs, status.rs)
 cargo test --test local some_name     # one test by name filter
@@ -23,7 +24,7 @@ Rust 1.89+, edition 2024. A C compiler is needed (tree-sitter grammars, zstd). g
 
 ## Architecture
 
-- **Single library, thin binaries.** All logic is in the `sprig` lib (`src/lib.rs`). `src/main.rs` just calls `cli::main()`. `sprig-ui` (`src/bin/sprig-ui.rs`) does not reimplement operations: every button calls `sprig::cli::run(cmd, args, &mut out)` on a worker thread, so the app and CLI share one code path. New user-facing operations go in `cli.rs` first, and the UI invokes them by command name.
+- **Single library, thin binaries.** All logic is in the `sprig` lib (`src/lib.rs`). `src/main.rs` just calls `cli::main()`. `sprig-ui` is Tauri: `src/bin/sprig-ui.rs` holds a few `#[tauri::command]`s (read state, diffs, conflicts, and `run`, which calls `sprig::cli::run`), and the page is plain HTML/CSS/JS in `ui/web` (no npm, no build step; `app.js` renders with template strings, so repository text must go through `esc()`). Config, icon and capabilities are in `ui/`; `build.rs` runs tauri-build only for `--features ui`. Actions never reimplement operations: new user-facing operations go in `cli.rs` first, and the page invokes them by command name through `run`.
 - **`Repo` (src/store.rs) is the hub.** Most functionality is `impl Repo` blocks spread across modules: `merge.rs` (commit/merge/checkout/undo, history walks), `git.rs` (import/export, GitHub sync), `remote.rs` (push/fetch/land client), `pack.rs` (packs, gc), `index.rs` (working-tree scan). Look for `impl Repo` in a module, not only in store.rs.
 - **Objects**: `blob`, `tree`, `change` (sprig's commit, with structured `meta`: intent/agent/model/checks, signature, `git_sha`), SHA-256 ids verified on every read. Loose zlib objects until `gc` packs them (zstd, deltas). Commands that add objects trigger a detached `gc --auto` (see the end of `cli::run`). Tests can disable it with `SPRIG_NO_AUTOGC`.
 - **Operation log / undo**: anything that moves refs or HEAD must go through `Repo::record(cmd, || ...)`, which snapshots state before and after so `sprig undo` works. Skipping it breaks undo.

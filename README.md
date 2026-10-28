@@ -68,7 +68,8 @@ To uninstall: `cargo uninstall sprig`, and delete `~/.config/sprig` if you made 
 
 ## Desktop app
 
-`sprig-ui` is a native window on a repository (Rust, egui), for Linux,
+`sprig-ui` is a desktop window on a repository (Rust and Tauri: the page is
+plain HTML, CSS and JavaScript in `ui/web`, no npm), for Linux,
 macOS and Windows:
 
 - **Inbox**: what needs you, in sections: conflicts HEAD recorded, the
@@ -99,8 +100,12 @@ cargo install --locked --path . --features ui   # installs sprig and sprig-ui
 sprig-ui path/to/repo                           # or run it inside the repo
 ```
 
-Linux needs the usual desktop libraries (X11 or Wayland, OpenGL, and
-`libxkbcommon-x11`), present on any desktop install.
+Building the app needs Rust 1.90 (the CLI alone needs 1.89). It draws in
+the system webview: WebKit on macOS, WebView2 on Windows (preinstalled on
+Windows 10 and 11), WebKitGTK on Linux (`sudo dnf install webkit2gtk4.1-devel
+libsoup3-devel` or `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev`).
+
+The screenshots below are of the earlier egui version.
 
 ![working changes](docs/ui-changes.png)
 
@@ -110,9 +115,9 @@ Linux needs the usual desktop libraries (X11 or Wayland, OpenGL, and
 
 #### Design
 
-The design system lives in one place, `theme` in `src/bin/sprig-ui.rs`:
-color, radius and spacing tokens, plus a few components (card, primary
-button, pill, +N −N counts, banner, list row). The patterns come from
+The design system lives in one place, `ui/web/style.css`: color, radius
+and type tokens on `:root`, plus a few components (section, primary
+button, pill, badge, +N −N counts, banner, list row). The patterns come from
 source-control screens on [Mobbin](https://mobbin.com):
 
 | Pattern | Taken from |
@@ -443,7 +448,7 @@ src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
 src/complete.rs   shell completion (bash, zsh, fish)
-src/bin/sprig-ui.rs  the desktop app (`--features ui`)
+src/bin/sprig-ui.rs  the desktop app's commands (`--features ui`); its page is in ui/web
 tests/            integration tests (CLI as a subprocess, servers in-process)
 bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
@@ -510,10 +515,8 @@ Direct dependencies, each the standard crate for its job:
 | `notify` | `sprig watch` |
 | `memmap2`, `libc`, `getrandom` | mmap of packs and the index, local time, randomness |
 
-The desktop app adds `eframe` (egui, winit, glutin), only when built with
-`--features ui`; the CLI build does not include it. Its accessibility
-feature is left out because it pulls in a D-Bus stack that RustSec flags as
-unmaintained.
+The desktop app adds `tauri` (and `tauri-build` at build time), only when
+built with `--features ui`; the CLI build does not include it.
 
 All are pinned in `Cargo.lock` (82 crates in the CLI build, about 200 with
 the app on Linux). Checked before release:
