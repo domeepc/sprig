@@ -143,6 +143,9 @@ pub struct Config {
     /// remote that missing objects are fetched from on demand
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lazy: String,
+    /// the GitHub (or any git host) repository this one syncs with
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub github: String,
     /// only these path prefixes are in the working tree
     #[serde(default, deserialize_with = "nullable", skip_serializing_if = "Vec::is_empty")]
     pub sparse: Vec<String>,

@@ -6,6 +6,7 @@ pub mod util;
 
 pub mod cli;
 pub mod codemerge;
+pub mod complete;
 pub mod diff;
 pub mod git;
 pub mod index;

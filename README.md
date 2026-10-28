@@ -38,6 +38,17 @@ cargo install --locked --path .    # installs to ~/.cargo/bin
 sprig version
 ```
 
+Tab completion of commands, flags, branches, remotes and conflicted paths:
+
+```sh
+echo 'eval "$(sprig completion bash)"' >> ~/.bashrc
+echo 'source <(sprig completion zsh)' >> ~/.zshrc      # after compinit
+sprig completion fish > ~/.config/fish/completions/sprig.fish
+```
+
+The scripts are a few lines that ask `sprig __complete` what fits, so
+completion knows your branches and remotes and never goes out of date.
+
 `~/.cargo/bin` must be on your PATH (rustup sets that up). To build without
 installing: `cargo build --release`, which leaves the binary in
 `target/release/sprig`.
@@ -54,6 +65,61 @@ Optional setup:
 
 To update: `git pull && cargo install --locked --path .`.
 To uninstall: `cargo uninstall sprig`, and delete `~/.config/sprig` if you made a key.
+
+## Desktop app
+
+`sprig-ui` is a native window on a repository (Rust, egui), for Linux,
+macOS and Windows:
+
+- **History**: every change with its diff, provenance and author.
+- **Changes**: the working tree against HEAD, +N −N per file, and a diff
+  with line numbers (unified or side by side); commit everything or the
+  selected file.
+- **Branches**: switch, create, and merge one into the current branch.
+- **Sync**: pull and push with sprig servers (`sprig remote add`), and with
+  GitHub or any git host: enter the repository URL once, then Pull (fetch
+  and merge) and Push. git does the network part with your own credentials
+  (SSH key or credential helper).
+- **Conflicts**: ours, base and theirs side by side; take one side, or edit
+  the result and save it, then commit.
+- **Undo** of the last operation (again = redo).
+
+Each button runs the same code as the matching command (`checkout`,
+`merge`, `pull`, `github pull`...), so the app and the CLI behave the same
+and everything lands in `sprig ops`.
+
+```sh
+cargo install --locked --path . --features ui   # installs sprig and sprig-ui
+sprig-ui path/to/repo                           # or run it inside the repo
+```
+
+Linux needs the usual desktop libraries (X11 or Wayland, OpenGL, and
+`libxkbcommon-x11`), present on any desktop install.
+
+![working changes](docs/ui-changes.png)
+
+![history, side-by-side diff](docs/ui-history.png)
+
+![resolving a conflict](docs/ui-conflict.png)
+
+#### Design
+
+The design system lives in one place, `theme` in `src/bin/sprig-ui.rs`:
+color, radius and spacing tokens, plus a few components (card, primary
+button, pill, +N −N counts, banner, list row). The patterns come from
+source-control screens on [Mobbin](https://mobbin.com):
+
+| Pattern | Taken from |
+|---|---|
+| Light neutral canvas, bordered cards, blue selection; history rows with a title and an "author · sha · time" line | GitHub commit list and compare ([1](https://mobbin.com/screens/74b0d6a5-8630-4cea-9a70-d7a3338e802d), [2](https://mobbin.com/screens/13c9c426-fbb5-4b38-be81-d2a88cd89fdc), [3](https://mobbin.com/screens/6da8411f-4296-446a-ab95-e57456a48714)) |
+| Diff with line-number gutters, tinted added and removed lines, "+23 −0" per file, Unified/Split switch | GitLab commit diff ([1](https://mobbin.com/screens/95e376da-81cd-465c-a99b-a0051f9a2baf), [2](https://mobbin.com/screens/5dc51455-c50f-403e-a5bf-ca8e432784b4)), GitHub compare ([3](https://mobbin.com/screens/168fa0b6-a33c-4172-8fe0-984ecc63db45)) |
+| Segmented Changes / History / Conflicts switch, file rows with +N −N, dark primary button | Cursor Git panel ([1](https://mobbin.com/screens/d744068a-1835-4c35-afa2-e560ccbe565d), [2](https://mobbin.com/screens/cb7068e4-44d5-4f04-9c5c-855782a96309), [3](https://mobbin.com/screens/bc80d597-15fe-4a3d-b09f-7bb7fda745b3)) |
+| AI-review layout: file list with counts beside a split diff | Mobbin has no CodeRabbit screens; the closest AI review tools stood in: Devin ([1](https://mobbin.com/screens/aeaed0d8-a1c1-4094-8615-c34f45cc7c45)), Graphite ([2](https://mobbin.com/screens/8dbeb6a4-fddd-4e76-ad84-8590cb61f8b7)), Replit ([3](https://mobbin.com/screens/e92dd0ec-6660-4610-930a-38900c351734)) |
+| Conflicts: a warning strip, sides as columns with one "keep this side" button each | Front merge review ([1](https://mobbin.com/screens/0ecf2195-42d2-4db8-a7c4-46a176759c17)), Codecademy compare ([2](https://mobbin.com/screens/3db54285-08df-44c3-a226-cf3e168b5e85)) |
+
+The same GitHub sync works from the command line: `sprig github set <url>`,
+then `sprig github pull` and `sprig github push` (it keeps a bare mirror in
+`.sprig/github.git` and uses `import-git`/`export-git`, described below).
 
 ## What's different from git
 
@@ -364,6 +430,8 @@ src/sign.rs       ed25519 change signatures
 src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
+src/complete.rs   shell completion (bash, zsh, fish)
+src/bin/sprig-ui.rs  the desktop app (`--features ui`)
 tests/            integration tests (CLI as a subprocess, servers in-process)
 bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
 ```
@@ -430,8 +498,13 @@ Direct dependencies, each the standard crate for its job:
 | `notify` | `sprig watch` |
 | `memmap2`, `libc`, `getrandom` | mmap of packs and the index, local time, randomness |
 
-All are pinned in `Cargo.lock` (82 crates in the build, 114 counting other
-platforms). Checked before release:
+The desktop app adds `eframe` (egui, winit, glutin), only when built with
+`--features ui`; the CLI build does not include it. Its accessibility
+feature is left out because it pulls in a D-Bus stack that RustSec flags as
+unmaintained.
+
+All are pinned in `Cargo.lock` (82 crates in the CLI build, about 200 with
+the app on Linux). Checked before release:
 
 - `cargo audit` against the RustSec advisory database: no vulnerabilities,
   no unmaintained or yanked crates.

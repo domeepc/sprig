@@ -588,3 +588,94 @@ fn fast_import_path(p: &str) -> String {
     }
     p.to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Syncing with GitHub (or any git host). sprig speaks no git protocol: a
+// bare git mirror in .sprig/github.git is kept in step with the host, and
+// git does the network part with the user's own credentials.
+
+/// What a pull did.
+#[derive(Debug, Default)]
+pub struct PullOutcome {
+    pub summary: String,
+    /// paths left with conflicts by merging the host's version
+    pub conflicts: Vec<String>,
+}
+
+impl Repo {
+    pub fn github_mirror(&self) -> std::path::PathBuf {
+        self.dir.join("github.git")
+    }
+
+    /// Makes the mirror (cloning it the first time) and fetches the host's
+    /// branches into it.
+    fn sync_mirror(&self, url: &str) -> Result<String> {
+        if url.is_empty() {
+            bail!("no GitHub repository set");
+        }
+        let m = self.github_mirror().to_string_lossy().into_owned();
+        if !self.github_mirror().exists() {
+            git_output(".", &["clone", "--bare", "--quiet", url, &m])?;
+        } else {
+            git_output(&m, &["remote", "set-url", "origin", url])?;
+            git_output(&m, &["fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*"])?;
+        }
+        Ok(m)
+    }
+
+    /// Brings in the host's commits and merges the host's version of the
+    /// current branch if both sides moved. Conflicts are recorded as usual.
+    pub fn github_pull(&self, url: &str) -> Result<PullOutcome> {
+        let m = self.sync_mirror(url)?;
+        let had: std::collections::HashSet<String> = self.list_refs().into_values().collect();
+        let known = |r: &Repo| -> Result<std::collections::HashSet<String>> {
+            let mut seen = std::collections::HashSet::new();
+            for tip in &had {
+                seen.extend(r.ancestors(tip)?.into_keys());
+            }
+            Ok(seen)
+        };
+        let before = known(self)?;
+        self.import_git(&m, false)?;
+        let mut new = std::collections::HashSet::new();
+        for tip in self.list_refs().into_values() {
+            new.extend(self.ancestors(&tip)?.into_keys().filter(|id| !before.contains(id)));
+        }
+        let mut out =
+            PullOutcome { summary: format!("pulled {} new change(s) from {url}", new.len()), conflicts: vec![] };
+        let (head_ref, cur) = self.head();
+        let Some(branch) = head_ref.strip_prefix("heads/") else { return Ok(out) };
+        let theirs = format!("remotes/git/{branch}");
+        match self.read_ref(&theirs) {
+            Some(id) if !cur.is_empty() && !self.is_ancestor(&id, &cur)? => {
+                let rev = format!("git/{branch}");
+                let res = self.record(&format!("merge {rev}"), || self.merge(&rev, false, "", Default::default()))?;
+                out.conflicts = res.conflicts.into_iter().map(|c| c.path).collect();
+                out.summary += &format!("; merged GitHub's {branch} ({})", res.kind);
+            }
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    /// Writes the current branch into the mirror and pushes it to the host.
+    /// The host must not have commits this repository lacks: pull first.
+    pub fn github_push(&self, url: &str) -> Result<String> {
+        let (head_ref, _) = self.head();
+        let Some(branch) = head_ref.strip_prefix("heads/") else { bail!("HEAD is detached; check out a branch") };
+        let m = self.sync_mirror(url)?;
+        let res = self.export_git(&m, false).map_err(|e| {
+            if e.to_string().contains("does not contain") {
+                err!("GitHub has commits you don't have; pull first")
+            } else {
+                e
+            }
+        })?;
+        if let Some(w) = res.warnings.iter().find(|w| w.contains(&format!("{branch:?}"))) {
+            bail!("not pushed: {w}");
+        }
+        git_output(&m, &["push", "--quiet", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")])
+            .map_err(|e| err!("{e}\nhint: if GitHub moved, pull first"))?;
+        Ok(format!("pushed {branch} to {url} ({} new commit(s))", res.commits))
+    }
+}
