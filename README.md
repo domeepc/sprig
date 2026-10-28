@@ -50,7 +50,8 @@ Then, once:
   `~/.config/sprig/author` (all repositories; a repository's own setting and
   `SPRIG_AUTHOR` win over it).
 - **Signing:** `sprig keygen --ssh ~/.ssh/id_ed25519` signs your changes with
-  your SSH key (ed25519, no passphrase), or `sprig keygen` makes a sprig key.
+  your SSH key (ed25519; one with a passphrase signs through ssh-agent once
+  you `ssh-add` it), or `sprig keygen` makes a sprig key.
 - `sprig watch` in a repo you work in a lot keeps `status` fast.
 
 Update with `git pull && cargo install --locked --path .`; uninstall with
@@ -240,11 +241,16 @@ check out everything.
 
 ```sh
 sprig keygen                       # writes ~/.config/sprig/signing.key (or $SPRIG_KEY)
-sprig keygen --ssh ~/.ssh/id_ed25519   # or sign with your SSH key (ed25519, no passphrase)
+sprig keygen --ssh ~/.ssh/id_ed25519   # or sign with your SSH key (ed25519)
 sprig trust ed25519:AbC... alice   # keys audit --signed accepts
 sprig trust "$(cat ~/.ssh/id_ed25519.pub)" alice   # a .pub line works too
 sprig audit --signed --require review
 ```
+
+An SSH key without a passphrase is read directly; one with a passphrase is
+signed with by ssh-agent (`ssh-add` it first; sprig asks the agent over
+`SSH_AUTH_SOCK` and needs the key's `.pub` beside it). The signatures are
+the same either way.
 
 With a key, `commit`, `merge` and `land` sign the changes they create, and
 `show`/`log` print who signed each one. A landed change is assembled by the
@@ -535,6 +541,5 @@ Re-check after changing dependencies with `cargo install cargo-audit` and
   merge is left as two files rather than reported as a conflict.
 - **No pull requests.** `sprig github push` pushes a branch; open the pull
   request on GitHub or with `gh pr create`.
-- **SSH keys with a passphrase can't sign.** sprig reads the key file
-  itself and does not talk to ssh-agent yet; use an unencrypted ed25519
-  key or a sprig key.
+- **Only ed25519 keys sign.** RSA and ECDSA SSH keys are not supported, and
+  signing through ssh-agent works on Linux and macOS, not Windows.

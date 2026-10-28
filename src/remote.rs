@@ -442,7 +442,7 @@ impl Repo {
             sig: None,
         };
         if let Some(key) = sign::signing_key()? {
-            lr.sig = Some(sign::sign(&key, &sign::land_payload(&proof, &lr.message, &lr.author, &lr.meta)));
+            lr.sig = Some(sign::sign(&key, &sign::land_payload(&proof, &lr.message, &lr.author, &lr.meta))?);
         }
         let res = rm.land(&lr).map_err(|e| match e {
             Error::Remote { ref msg, .. } if msg.contains("unknown base") => err!(

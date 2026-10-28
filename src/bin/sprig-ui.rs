@@ -411,7 +411,9 @@ struct SshKey {
     comment: String,
     /// its sprig public key
     key: String,
-    /// passphrase-protected: sprig can't sign with it
+    /// passphrase-protected: ssh-agent signs with it
+    agent: bool,
+    /// passphrase-protected and ssh-agent doesn't hold it: `ssh-add` first
     locked: bool,
 }
 
@@ -458,10 +460,13 @@ fn settings() -> Res<Settings> {
         if !std::path::Path::new(private).exists() {
             continue;
         }
-        let locked = sprig::sign::read_ssh_key(std::path::Path::new(private))
-            .is_err_and(|e| e.to_string().contains("passphrase"));
+        let (agent, locked) = match sprig::sign::read_ssh_key(std::path::Path::new(private)) {
+            Ok(sprig::sign::Key::Agent(pk)) => (true, !sprig::sign::agent_has(&pk).unwrap_or(false)),
+            Ok(_) => (false, false),
+            Err(_) => continue, // not a key sprig can sign with
+        };
         let comment = line.split_whitespace().nth(2).unwrap_or("").to_string();
-        ssh.push(SshKey { path: private.into(), comment, key: public, locked });
+        ssh.push(SshKey { path: private.into(), comment, key: public, agent, locked });
     }
     ssh.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Settings {
@@ -510,7 +515,12 @@ fn setup_signing(ssh: Option<String>, replace: bool) -> Res<String> {
         Some(k) if !replace => k,
         _ => {
             if let Some(p) = &ssh {
-                sprig::sign::read_ssh_key(std::path::Path::new(p)).map_err(e)?; // before the old key moves
+                // before the old key moves: a key that can't sign stops here
+                if let sprig::sign::Key::Agent(pk) = sprig::sign::read_ssh_key(std::path::Path::new(p)).map_err(e)?
+                    && !sprig::sign::agent_has(&pk).map_err(e)?
+                {
+                    return Err(format!("{p} has a passphrase and ssh-agent doesn't hold it; run `ssh-add {p}` first"));
+                }
             }
             sprig::sign::retire_key().map_err(e)?;
             match ssh {

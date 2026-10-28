@@ -63,24 +63,42 @@ fn key_path() -> Result<PathBuf> {
     Ok(config_dir().ok_or_else(|| err!("neither $XDG_CONFIG_HOME nor $HOME are defined"))?.join("sprig/signing.key"))
 }
 
-/// The user's private key, or None if they have none. It is sprig's own
-/// (base64 seed) or an OpenSSH ed25519 key (`sprig keygen --ssh`).
-pub fn signing_key() -> Result<Option<SigningKey>> {
+/// A key that signs: one sprig reads itself, or a passphrase-protected SSH
+/// key that ssh-agent holds (sprig only knows its public half).
+pub enum Key {
+    Local(SigningKey),
+    Agent([u8; 32]),
+}
+
+impl Key {
+    pub fn public(&self) -> String {
+        let raw = match self {
+            Key::Local(k) => k.verifying_key().to_bytes(),
+            Key::Agent(pk) => *pk,
+        };
+        format!("{KEY_PREFIX}{}", B64.encode(raw))
+    }
+}
+
+/// The user's signing key, or None if they have none. It is sprig's own
+/// (base64 seed) or an OpenSSH ed25519 key (`sprig keygen --ssh`); one with a
+/// passphrase signs through ssh-agent.
+pub fn signing_key() -> Result<Option<Key>> {
     let p = key_path()?;
     let b = match std::fs::read_to_string(&p) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         r => r?,
     };
     if b.starts_with(OPENSSH) {
-        let seed = openssh_seed(&b).map_err(|e| err!("{}: {e}", p.display()))?;
-        return Ok(Some(SigningKey::from_bytes(&seed)));
+        // a link to the SSH key: its .pub sits next to where it points
+        return read_ssh_key(&std::fs::canonicalize(&p).unwrap_or(p)).map(Some);
     }
     let seed: [u8; 32] = B64
         .decode(b.trim())
         .ok()
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| err!("{} is not a sprig signing key", p.display()))?;
-    Ok(Some(SigningKey::from_bytes(&seed)))
+    Ok(Some(Key::Local(SigningKey::from_bytes(&seed))))
 }
 
 const OPENSSH: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
@@ -93,15 +111,15 @@ fn field<'a>(r: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(f)
 }
 
-/// The seed of an unencrypted ed25519 key in OpenSSH's file format (what
-/// `ssh-keygen -t ed25519` writes).
-fn openssh_seed(text: &str) -> Result<[u8; 32]> {
+/// The seed of an ed25519 key in OpenSSH's file format (what `ssh-keygen
+/// -t ed25519` writes); None when a passphrase encrypts it.
+fn openssh_seed(text: &str) -> Result<Option<[u8; 32]>> {
     let body: String = text.lines().filter(|l| !l.starts_with("-----")).collect();
     let bad = || err!("not an OpenSSH private key");
     let b = B64.decode(body.trim()).map_err(|_| bad())?;
     let mut r = b.strip_prefix(b"openssh-key-v1\0".as_slice()).ok_or_else(bad)?;
     if field(&mut r).ok_or_else(bad)? != b"none" {
-        bail!("the key has a passphrase; sprig can only sign with an unencrypted key");
+        return Ok(None);
     }
     field(&mut r).ok_or_else(bad)?; // kdf name
     field(&mut r).ok_or_else(bad)?; // kdf options
@@ -114,11 +132,15 @@ fn openssh_seed(text: &str) -> Result<[u8; 32]> {
     }
     field(&mut p).ok_or_else(bad)?; // public key again
     let private = field(&mut p).ok_or_else(bad)?; // seed, then public key
-    private.get(..32).and_then(|s| s.try_into().ok()).ok_or_else(bad)
+    private.get(..32).and_then(|s| s.try_into().ok()).ok_or_else(bad).map(Some)
 }
 
 /// "ssh-ed25519 AAAA… comment" (a .pub file's line) as a sprig public key.
 pub fn ssh_public(line: &str) -> Option<String> {
+    ssh_public_raw(line).map(|k| format!("{KEY_PREFIX}{}", B64.encode(k)))
+}
+
+fn ssh_public_raw(line: &str) -> Option<[u8; 32]> {
     let mut parts = line.split_whitespace();
     if parts.next()? != "ssh-ed25519" {
         return None;
@@ -128,19 +150,100 @@ pub fn ssh_public(line: &str) -> Option<String> {
     if field(&mut r)? != b"ssh-ed25519" {
         return None;
     }
-    let key: [u8; 32] = field(&mut r)?.try_into().ok()?;
-    Some(format!("{KEY_PREFIX}{}", B64.encode(key)))
+    field(&mut r)?.try_into().ok()
 }
 
-/// An SSH private key file, if sprig can sign with it.
-pub fn read_ssh_key(ssh: &std::path::Path) -> Result<SigningKey> {
+/// An SSH private key file as a signing key. One with a passphrase is
+/// left to ssh-agent, so it needs its .pub beside it.
+pub fn read_ssh_key(ssh: &std::path::Path) -> Result<Key> {
     let text = std::fs::read_to_string(ssh).map_err(|e| err!("{}: {e}", ssh.display()))?;
-    Ok(SigningKey::from_bytes(&openssh_seed(&text).map_err(|e| err!("{}: {e}", ssh.display()))?))
+    if let Some(seed) = openssh_seed(&text).map_err(|e| err!("{}: {e}", ssh.display()))? {
+        return Ok(Key::Local(SigningKey::from_bytes(&seed)));
+    }
+    let pub_file = format!("{}.pub", ssh.display());
+    let line = std::fs::read_to_string(&pub_file).map_err(|e| {
+        err!("{} has a passphrase, so sprig signs through ssh-agent and needs {pub_file}: {e}", ssh.display())
+    })?;
+    ssh_public_raw(&line).map(Key::Agent).ok_or_else(|| err!("{pub_file} is not an ssh-ed25519 public key"))
+}
+
+// ---------------------------------------------------------------------------
+// ssh-agent: list its keys and have it sign, over $SSH_AUTH_SOCK
+
+fn wire(b: &[u8]) -> Vec<u8> {
+    [&(b.len() as u32).to_be_bytes()[..], b].concat()
+}
+
+fn key_blob(pk: &[u8; 32]) -> Vec<u8> {
+    [wire(b"ssh-ed25519"), wire(pk)].concat()
+}
+
+#[cfg(unix)]
+fn agent(req: &[u8]) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let sock = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err!("no ssh-agent (SSH_AUTH_SOCK is not set); start one and `ssh-add` the key"))?;
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| err!("ssh-agent: {e}"))?;
+    s.write_all(&wire(req))?;
+    let mut n = [0u8; 4];
+    s.read_exact(&mut n)?;
+    let mut b = vec![0u8; u32::from_be_bytes(n) as usize];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+
+#[cfg(not(unix))]
+fn agent(_: &[u8]) -> Result<Vec<u8>> {
+    bail!("signing through ssh-agent is only supported on Unix")
+}
+
+/// Whether ssh-agent holds this key (it may be running without it).
+pub fn agent_has(pk: &[u8; 32]) -> Result<bool> {
+    let r = agent(&[11])?; // SSH2_AGENTC_REQUEST_IDENTITIES
+    let bad = || err!("ssh-agent sent a malformed key list");
+    let mut r = r.strip_prefix(&[12u8][..]).ok_or_else(bad)?; // SSH2_AGENT_IDENTITIES_ANSWER
+    let n = u32::from_be_bytes(r.get(..4).ok_or_else(bad)?.try_into().unwrap());
+    r = &r[4..];
+    let want = key_blob(pk);
+    for _ in 0..n {
+        let blob = field(&mut r).ok_or_else(bad)?;
+        field(&mut r).ok_or_else(bad)?; // comment
+        if blob == want.as_slice() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn agent_sign(pk: &[u8; 32], data: &[u8]) -> Result<[u8; 64]> {
+    // SSH2_AGENTC_SIGN_REQUEST: key blob, data, flags. Ed25519 signs the
+    // data itself, so this is the same signature sprig would make.
+    let req = [&[13u8][..], &wire(&key_blob(pk)), &wire(data), &0u32.to_be_bytes()].concat();
+    let r = agent(&req)?;
+    let Some(mut r) = r.strip_prefix(&[14u8][..]) else {
+        bail!("ssh-agent would not sign; add the key with `ssh-add <key file>`");
+    };
+    let bad = || err!("ssh-agent sent a malformed signature");
+    let mut sig = field(&mut r).ok_or_else(bad)?;
+    if field(&mut sig).ok_or_else(bad)? != b"ssh-ed25519" {
+        return Err(bad());
+    }
+    field(&mut sig).and_then(|s| s.try_into().ok()).ok_or_else(bad)
 }
 
 /// Signs with an SSH key from now on: the signing key path points at it.
 pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
     let key = read_ssh_key(ssh)?;
+    if let Key::Agent(pk) = &key
+        && !agent_has(pk)?
+    {
+        bail!(
+            "{} has a passphrase and ssh-agent doesn't hold it; run `ssh-add {}` first",
+            ssh.display(),
+            ssh.display()
+        );
+    }
     let p = key_path()?;
     if p.exists() {
         bail!("{} already exists", p.display());
@@ -153,7 +256,7 @@ pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
     std::os::unix::fs::symlink(&ssh, &p)?;
     #[cfg(not(unix))]
     std::fs::copy(&ssh, &p)?; // ponytail: a copy, not a link; symlinks need admin rights on Windows
-    Ok((p, public_key(&key)))
+    Ok((p, key.public()))
 }
 
 /// Moves the signing key out of the way before another takes its place: a
@@ -197,7 +300,7 @@ pub fn set_global_author(author: &str) -> Result<()> {
 
 /// The public half of the user's signing key, if they have one.
 pub fn my_public_key() -> Result<Option<String>> {
-    Ok(signing_key()?.map(|k| public_key(&k)))
+    Ok(signing_key()?.map(|k| k.public()))
 }
 
 pub fn generate_key() -> Result<(PathBuf, String)> {
@@ -221,11 +324,7 @@ pub fn generate_key() -> Result<(PathBuf, String)> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     std::io::Write::write_all(&mut opts.open(&p)?, format!("{}\n", B64.encode(seed)).as_bytes())?;
-    Ok((p, public_key(&key)))
-}
-
-fn public_key(key: &SigningKey) -> String {
-    format!("{KEY_PREFIX}{}", B64.encode(key.verifying_key().to_bytes()))
+    Ok((p, Key::Local(key).public()))
 }
 
 pub fn change_payload(c: &Change) -> Vec<u8> {
@@ -245,8 +344,14 @@ pub fn land_payload(p: &LandProof, message: &str, author: &str, meta: &Meta) -> 
     [b"sprig-land-v1\n".as_slice(), &util::to_json(&Payload { author, message, meta, proof: p })].concat()
 }
 
-pub fn sign(key: &SigningKey, payload: &[u8]) -> Signature {
-    Signature { key: public_key(key), sig: B64.encode(key.sign(payload).to_bytes()), ..Default::default() }
+pub fn sign(key: &Key, payload: &[u8]) -> Result<Signature> {
+    let raw = match key {
+        Key::Local(k) => k.sign(payload).to_bytes(),
+        Key::Agent(pk) => agent_sign(pk, payload)?,
+    };
+    let s = Signature { key: key.public(), sig: B64.encode(raw), ..Default::default() };
+    check_sig(&s, payload)?; // an agent could answer with another key's signature
+    Ok(s)
 }
 
 pub fn check_sig(s: &Signature, payload: &[u8]) -> Result<()> {

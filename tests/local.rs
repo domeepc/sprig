@@ -712,3 +712,61 @@ fn signs_with_an_ssh_key() {
     c.must(&["trust", "-d", public.trim()]); // the .pub line works here too
     assert_eq!(c.must(&["trust"]), "");
 }
+
+/// A passphrase-protected key signs through ssh-agent.
+#[cfg(unix)]
+#[test]
+fn signs_with_a_key_in_ssh_agent() {
+    use std::process::{Command, Stdio};
+    if Command::new("ssh-agent").arg("-?").stderr(Stdio::null()).output().is_err() {
+        return;
+    }
+    let mut c = Ctx::new();
+    let dir = c.temp();
+    let ssh = dir.join("id_locked");
+    let st = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "s3cret", "-C", "locked", "-f"])
+        .arg(&ssh)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let sock = dir.join("agent.sock");
+    let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    c.setenv("SSH_AUTH_SOCK", sock.to_str().unwrap());
+    c.setenv("SPRIG_KEY", dir.join("signing.key").to_str().unwrap());
+
+    // not in the agent yet: refused, and nothing is set up
+    let e = c.sp(&["keygen", "--ssh", ssh.to_str().unwrap()]).unwrap_err();
+    assert!(e.err.contains("ssh-add"), "{e}");
+
+    let askpass = dir.join("askpass");
+    std::fs::write(&askpass, "#!/bin/sh\necho s3cret\n").unwrap();
+    chmod(&askpass, 0o755);
+    let added = Command::new("ssh-add")
+        .arg(&ssh)
+        .env("SSH_AUTH_SOCK", &sock)
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(added.success());
+
+    c.must(&["keygen", "--ssh", ssh.to_str().unwrap()]);
+    let public = std::fs::read_to_string(dir.join("id_locked.pub")).unwrap();
+    c.must(&["trust", public.trim(), "me"]);
+    c.write("a.txt", "x\n");
+    c.must(&["commit", "-m", "signed by the agent", "--agent", "bot", "--check", "review=pass"]);
+    let audit = c.must(&["audit", "--signed"]);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert!(audit.starts_with("0 of 1"), "{audit}");
+}

@@ -492,11 +492,11 @@ function settingsPage() {
   const keyRows = rows
     .map((s) => {
       const def = s.key === k.key;
-      const tags = [def && tag("Default", "blue"), trustedKeys.has(s.key) && tag("Trusted here", "green"), !def && !s.locked && tag("SSH key", "gray"), s.locked && tag("Passphrase", "gray")].filter(Boolean).join("");
+      const tags = [def && tag("Default", "blue"), trustedKeys.has(s.key) && tag("Trusted here", "green"), !def && !s.agent && tag("SSH key", "gray"), s.agent && tag("ssh-agent", "gray")].filter(Boolean).join("");
       const action = def
         ? `<button class="btn" data-act="copy" data-text="${esc(s.key)}">Copy public key</button>`
         : s.locked
-          ? '<span class="small muted">needs passphrase</span>'
+          ? `<span class="small muted" title="it has a passphrase; ssh-agent signs with it once added">run ssh-add ${esc(s.name)}</span>`
           : `<button class="btn soft" data-act="key-default" data-path="${esc(s.path ?? "")}">Make default</button>`;
       return `<div class="krow"><span class="kname"><span class="kicon${def ? " on" : ""}" aria-hidden="true">${icon("key", 14)}</span>
         <span><b class="mono">${esc(s.name)}</b><small>${esc(s.where)}</small></span></span>
@@ -518,7 +518,7 @@ function settingsPage() {
   const head = (title, text, extra = "") => `<div class="shead"><div><h2>${title}</h2><p>${text}</p></div>${extra}</div>`;
   return `<div class="settings">
     <section>${head("Commit identity", "The name and email written on every change you make. Agents still get their own <span class=\"mono\">--agent</span>.")}${identity}</section>
-    <section>${head("Signing keys", "The default key signs every change, merge and landing. Any ed25519 SSH key without a passphrase works.",
+    <section>${head("Signing keys", "The default key signs every change, merge and landing. Any ed25519 SSH key works; one with a passphrase signs through ssh-agent.",
       `<button class="btn soft" data-act="key-generate">${icon("plus", 13)} Generate sprig key</button>`)}${keys}</section>
     <section>${head("Trusted in this repository", "Changes signed by these keys show as verified, and <span class=\"mono\">sprig audit --signed</span> accepts them.")}${trusted}</section></div>`;
 }
@@ -1009,7 +1009,7 @@ function openKeys(error = "") {
   $("keys").innerHTML = `<form method="dialog">
     <h2>${icon("shield", 16, "#3fb950")} Sign your changes</h2>
     <p class="muted">Signed changes show who really made them, and <span class="mono">sprig audit --signed</span> checks them.
-      ${k.key ? "" : "An ed25519 SSH key without a passphrase works as is."}</p>
+      ${k.key ? "" : "Any ed25519 SSH key works; one with a passphrase signs through ssh-agent once you ssh-add it."}</p>
     ${mine}${error ? `<p class="err">${esc(error)}</p>` : ""}
     <div class="end"><button class="btn" value="cancel" data-act="keys-later">Not now</button>
       <button class="btn primary" data-act="keys-use">${k.key ? "Trust my key here" : "Use this key"}</button></div></form>`;

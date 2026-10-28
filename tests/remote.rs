@@ -461,7 +461,8 @@ fn land_follows_rename() {
         )]),
         ..Default::default()
     };
-    lr.sig = Some(sign(&key, &land_payload(&proof, &lr.message, &lr.author, &lr.meta)));
+    let key = sprig::sign::Key::Local(key);
+    lr.sig = Some(sign(&key, &land_payload(&proof, &lr.message, &lr.author, &lr.meta)).unwrap());
     let res = Remote::new("t", &url).land(&lr).expect("landing on a renamed file");
     let repo = &s.repo;
     let flat = repo.change_flat(&res.id).unwrap();

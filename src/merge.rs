@@ -295,10 +295,9 @@ impl Repo {
             conflicts,
             ..Default::default()
         };
-        match sign::signing_key() {
+        match sign::signing_key().and_then(|k| k.map(|k| sign::sign(&k, &sign::change_payload(&c))).transpose()) {
             Err(e) => eprintln!("warning: change not signed: {e}"),
-            Ok(Some(key)) => c.sig = Some(sign::sign(&key, &sign::change_payload(&c))),
-            Ok(None) => {}
+            Ok(sig) => c.sig = sig,
         }
         c
     }
