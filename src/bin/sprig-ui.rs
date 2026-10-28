@@ -75,6 +75,26 @@ impl Row {
     }
 }
 
+/// A file HEAD's merge left to resolve.
+#[derive(Serialize)]
+struct ConflictRow {
+    path: String,
+    /// what each side did to it: added, deleted, modified or unchanged
+    ours: &'static str,
+    theirs: &'static str,
+    /// the working file no longer has conflict markers
+    resolved: bool,
+}
+
+fn side(base: &str, id: &str) -> &'static str {
+    match (base.is_empty(), id.is_empty()) {
+        (true, false) => "added",
+        (false, true) => "deleted",
+        _ if base == id => "unchanged",
+        _ => "modified",
+    }
+}
+
 #[derive(Serialize)]
 struct State {
     name: String,
@@ -87,7 +107,7 @@ struct State {
     /// commits on the branch GitHub lacks, and the other way round, as of the last pull
     ahead_behind: Option<(usize, usize)>,
     changes: Vec<FileChange>,
-    conflicts: Vec<String>,
+    conflicts: Vec<ConflictRow>,
     history: Vec<Row>,
     now: i64,
 }
@@ -199,7 +219,16 @@ fn state() -> Res<State> {
     let mut history = vec![];
     let mut conflicts = vec![];
     if !head.is_empty() {
-        conflicts = r.get_change(&head).map_err(e)?.conflicts.into_iter().map(|c| c.path).collect();
+        conflicts = r
+            .get_change(&head)
+            .map_err(e)?
+            .conflicts
+            .into_iter()
+            .map(|c| {
+                let resolved = std::fs::read(r.abs(&c.path)).is_ok_and(|b| !sprig::tree::has_markers(&b));
+                ConflictRow { ours: side(&c.base, &c.ours), theirs: side(&c.base, &c.theirs), resolved, path: c.path }
+            })
+            .collect();
         r.walk(&head, |id, c| {
             history.push(Row::new(id, c));
             history.len() < 500
@@ -348,19 +377,38 @@ fn save(path: String, text: String) -> Res<()> {
 }
 
 #[derive(Serialize)]
+struct SshKey {
+    path: String,
+    comment: String,
+    /// its sprig public key
+    key: String,
+    /// passphrase-protected: sprig can't sign with it
+    locked: bool,
+}
+
+#[derive(Serialize)]
 struct Settings {
-    /// this repository's commit author, split
+    /// this repository's commit author, split; empty when it uses the default
     name: String,
     email: String,
-    /// SPRIG_AUTHOR is set and wins over the above
+    /// the default for all repositories (~/.config/sprig/author), split
+    global_name: String,
+    global_email: String,
+    /// SPRIG_AUTHOR is set and wins over both
     env_author: String,
     /// the public half of the signing key, if there is one, and its file
     key: Option<String>,
     key_file: String,
     /// whether this repository trusts the key
     trusted: bool,
-    /// ed25519 SSH keys that could sign instead: (private key path, its .pub line's comment)
-    ssh: Vec<(String, String)>,
+    ssh: Vec<SshKey>,
+    /// keys this repository trusts: (key, name)
+    trusted_keys: Vec<(String, String)>,
+}
+
+fn split_author(a: &str) -> (String, String) {
+    let (n, e) = a.split_once(" <").unwrap_or((a, ""));
+    (n.to_string(), e.trim_end_matches('>').to_string())
 }
 
 #[tauri::command(async)]
@@ -368,40 +416,56 @@ fn settings() -> Res<Settings> {
     let r = repo()?;
     let e = |e: Error| e.to_string();
     let cfg = r.load_config();
-    let (name, email) = cfg.author.split_once(" <").unwrap_or((&cfg.author, ""));
+    let (name, email) = split_author(&cfg.author);
+    let (global_name, global_email) = split_author(&sprig::sign::global_author());
     let key = sprig::sign::my_public_key().map_err(e)?;
     let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".ssh");
     let mut ssh = vec![];
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
+    for ent in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = ent.path();
         let Some(private) = p.to_str().and_then(|s| s.strip_suffix(".pub")) else { continue };
         let line = std::fs::read_to_string(&p).unwrap_or_default();
-        if sprig::sign::ssh_public(&line).is_some() && std::path::Path::new(private).exists() {
-            ssh.push((private.to_string(), line.split_whitespace().nth(2).unwrap_or("").to_string()));
+        let Some(public) = sprig::sign::ssh_public(&line) else { continue };
+        if !std::path::Path::new(private).exists() {
+            continue;
         }
+        let locked = sprig::sign::read_ssh_key(std::path::Path::new(private))
+            .is_err_and(|e| e.to_string().contains("passphrase"));
+        let comment = line.split_whitespace().nth(2).unwrap_or("").to_string();
+        ssh.push(SshKey { path: private.into(), comment, key: public, locked });
     }
-    ssh.sort();
+    ssh.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Settings {
-        name: name.into(),
-        email: email.trim_end_matches('>').into(),
+        name,
+        email,
+        global_name,
+        global_email,
         env_author: std::env::var("SPRIG_AUTHOR").unwrap_or_default(),
         trusted: key.as_ref().is_some_and(|k| cfg.trusted.contains_key(k)),
         key,
         key_file: sprig::sign::key_file().map_err(e)?.display().to_string(),
         ssh,
+        trusted_keys: cfg.trusted.into_iter().collect(),
     })
 }
 
-/// Sets this repository's commit author.
+/// Sets the commit author for this repository, or the default for all of
+/// them (which also drops this repository's own, so the default shows).
 #[tauri::command(async)]
-fn set_author(name: String, email: String) -> Res<()> {
+fn set_author(name: String, email: String, global: bool) -> Res<()> {
     let (name, email) = (name.trim(), email.trim());
     if name.is_empty() || [name, email].iter().any(|s| s.contains(['<', '>', '\n'])) {
         return Err("give a name, and an email without < > or line breaks".into());
     }
+    let author = format!("{name} <{email}>");
     let r = repo()?;
     let mut cfg = r.load_config();
-    cfg.author = format!("{name} <{email}>");
+    if global {
+        sprig::sign::set_global_author(&author).map_err(|e| e.to_string())?;
+        cfg.author.clear();
+    } else {
+        cfg.author = author;
+    }
     r.save_config(&cfg).map_err(|e| e.to_string())
 }
 
