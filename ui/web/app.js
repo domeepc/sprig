@@ -494,7 +494,8 @@ function settingsPage() {
       const def = s.key === k.key;
       const tags = [def && tag("Default", "blue"), trustedKeys.has(s.key) && tag("Trusted here", "green"), !def && !s.agent && tag("SSH key", "gray"), s.agent && tag("ssh-agent", "gray")].filter(Boolean).join("");
       const action = def
-        ? `<button class="btn" data-act="copy" data-text="${esc(s.key)}">Copy public key</button>`
+        ? `<span class="acts"><button class="btn" data-act="copy" data-text="${esc(s.key)}">Copy</button>
+            <button class="btn" data-act="key-remove" data-ssh="${s.path ? "1" : ""}" aria-label="Stop signing with ${esc(s.name)}">Remove</button></span>`
         : s.locked
           ? `<span class="small muted" title="it has a passphrase; ssh-agent signs with it once added">run ssh-add ${esc(s.name)}</span>`
           : `<button class="btn soft" data-act="key-default" data-path="${esc(s.path ?? "")}">Make default</button>`;
@@ -829,6 +830,21 @@ document.addEventListener("click", async (ev) => {
     case "key-trust": return useKey(false);
     case "key-default": return setKey(d.path || null);
     case "key-generate": return setKey(null);
+    case "key-remove": {
+      const what = d.ssh
+        ? "sprig stops signing with it. The SSH key itself stays in ~/.ssh."
+        : "sprig stops signing with it. The key is kept as signing.key.old (or .old.1, .old.2…), not deleted.";
+      const ok = await ask("Remove the signing key?", `<p class="muted">${what} Changes it already signed still verify while it stays trusted.</p>`, "Remove", true);
+      if (!ok) return;
+      try {
+        await invoke("remove_signing_key");
+        V.status = { ok: true, text: "not signing any more" };
+      } catch (e) {
+        V.status = { ok: false, text: String(e) };
+      }
+      await loadSigning();
+      return render();
+    }
     case "trust-add": {
       const key = $("t-key").value.trim();
       const who = $("t-name").value.trim();

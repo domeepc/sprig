@@ -260,7 +260,8 @@ pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
 }
 
 /// Moves the signing key out of the way before another takes its place: a
-/// link to an SSH key is removed, a sprig key is kept as signing.key.old.
+/// link to an SSH key is removed, a sprig key is kept as signing.key.old
+/// (or .old.1, .old.2… when that is taken: a retired key is never overwritten).
 pub fn retire_key() -> Result<()> {
     let p = key_path()?;
     match std::fs::symlink_metadata(&p) {
@@ -268,10 +269,11 @@ pub fn retire_key() -> Result<()> {
         Err(e) => Err(e.into()),
         Ok(m) if m.file_type().is_symlink() => Ok(std::fs::remove_file(&p)?),
         Ok(_) => {
-            let old = p.with_extension("key.old");
-            if old.exists() {
-                bail!("{} already exists; move it away first", old.display());
-            }
+            let base = p.with_extension("key.old");
+            let old = (0..)
+                .map(|n| if n == 0 { base.clone() } else { base.with_extension(format!("old.{n}")) })
+                .find(|o| std::fs::symlink_metadata(o).is_err())
+                .expect("a free name");
             Ok(std::fs::rename(&p, &old)?)
         }
     }
@@ -417,5 +419,25 @@ impl Repo {
             }
         }
         Ok(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn retiring_twice_keeps_both_keys() {
+        let dir = std::env::temp_dir().join(format!("sprig-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("signing.key");
+        // SAFETY: this test is the only one that reads or sets SPRIG_KEY in this binary
+        unsafe { std::env::set_var("SPRIG_KEY", &key) };
+        for n in ["one", "two"] {
+            std::fs::write(&key, n).unwrap();
+            super::retire_key().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("signing.key.old")).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(dir.join("signing.key.old.1")).unwrap(), "two");
+        assert!(!key.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

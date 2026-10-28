@@ -503,6 +503,13 @@ fn set_author(name: String, email: String, global: bool) -> Res<()> {
     r.save_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Stops signing: a link to an SSH key goes, a sprig key is kept as
+/// signing.key.old. Nothing is deleted.
+#[tauri::command(async)]
+fn remove_signing_key() -> Res<()> {
+    sprig::sign::retire_key().map_err(|e| e.to_string())
+}
+
 /// Signs with the given SSH key, or a new sprig key when ssh is None, and
 /// trusts that key in this repository so its changes verify. Without
 /// replace, an existing key is kept and only trusted.
@@ -557,6 +564,7 @@ fn main() {
             settings,
             set_author,
             fetch,
+            remove_signing_key,
             setup_signing
         ])
         .run(tauri::generate_context!("ui/tauri.conf.json"))
