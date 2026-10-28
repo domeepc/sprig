@@ -132,11 +132,25 @@ source-control screens on [Mobbin](https://mobbin.com):
 | Conflicts: a warning strip, sides as columns with one "keep this side" button each | Front merge review ([1](https://mobbin.com/screens/0ecf2195-42d2-4db8-a7c4-46a176759c17)), Codecademy compare ([2](https://mobbin.com/screens/3db54285-08df-44c3-a226-cf3e168b5e85)) |
 
 The same GitHub sync works from the command line: `sprig github set <url>`,
-then `sprig github pull` and `sprig github push` (it keeps a bare mirror in
+then `sprig github fetch` (GitHub's branches arrive as `git/<branch>`; ones
+deleted there are dropped, and local branches of the same name are listed,
+never deleted), `sprig github pull` (fetch, then merge `git/<branch>`) and
+`sprig github push` (it keeps a bare mirror in
 `.sprig/github.git` and uses `import-git`/`export-git`, described below).
 SSH URLs (`git@github.com:you/repo.git`) use your ssh-agent and keys as
 plain git does; `sprig github key ~/.ssh/deploy_key` picks one key (a
 deploy key, say) for this repository, `sprig github key ''` drops it.
+
+### A working tree that also has a .git
+
+When the working tree has a `.git` folder next to `.sprig`, sprig keeps it in
+step: after every command that moves a branch or HEAD (commit, merge,
+checkout, branch, undo, pull...), the same branches, HEAD and index appear
+in git, so `git log`, `git status` and editors agree with sprig. Each commit
+is written as its changes against its parent, so this costs tens of
+milliseconds, not a re-export. A branch that git alone moved (a plain `git
+commit`) is never overwritten; sprig says so and leaves it. `.sprig/` is
+added to `.git/info/exclude`.
 
 ## What's different from git
 

@@ -1,8 +1,8 @@
 //! Converting to and from git: import reads objects through one long-lived
 //! `git cat-file --batch`, export writes a `git fast-import` stream.
 
-use crate::store::{CHANGE, Change, Repo, TREE, is_id, short, valid_ref_name};
-use crate::tree::Mode;
+use crate::store::{CHANGE, Change, Repo, State, TREE, is_id, short, valid_ref_name};
+use crate::tree::{FileEnt, Mode};
 use crate::util::{Result, go_json_str, go_lossy};
 use crate::{bail, err};
 use std::collections::{BTreeMap, HashMap};
@@ -90,6 +90,12 @@ impl Repo {
     /// Converts the branches of a git repository into sprig changes. It is
     /// deterministic: re-importing the same repository yields the same ids.
     pub fn import_git(&self, git_dir: &str, force: bool) -> Result<ImportResult> {
+        self.import_git_as(git_dir, force, false)
+    }
+
+    /// import_git; with remote, every git branch lands in remotes/git/<b>
+    /// and local branches are left alone (GitHub fetch).
+    pub fn import_git_as(&self, git_dir: &str, force: bool, remote: bool) -> Result<ImportResult> {
         let refs = git_output(git_dir, &["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])?;
         let branches: Vec<(String, String)> = refs
             .lines()
@@ -133,6 +139,11 @@ impl Repo {
                     imp.res.warnings.push(format!("branch {b:?} has a name sprig does not accept; skipped"));
                     continue;
                 }
+                if remote {
+                    self.write_ref(&format!("remotes/git/{b}"), &id)?;
+                    imp.res.branches.insert(b.clone(), id);
+                    continue;
+                }
                 if let (Some(cur), false) = (self.read_ref(&name), force) {
                     if self.is_ancestor(&id, &cur).unwrap_or(false) {
                         continue; // sprig already has everything git has here
@@ -165,6 +176,9 @@ impl Repo {
                     return Ok(()); // detached or unborn: leave HEAD alone
                 };
                 let Some(id) = imp.res.branches.get(&head).cloned() else { return Ok(()) };
+                if remote && self.read_ref(&format!("heads/{head}")).is_none() {
+                    self.write_ref(&format!("heads/{head}"), &id)?;
+                }
                 if self.working_deltas()?.iter().any(|d| d.new.is_some()) {
                     imp.res.warnings.push(format!(
                         "working tree is not empty; not checking out {head:?} (run `sprig checkout -f {head}` to do so)"
@@ -356,6 +370,11 @@ impl Repo {
     /// deterministic, so exporting twice yields the same commits. Branch
     /// updates must fast-forward unless force.
     pub fn export_git(&self, git_dir: &str, force: bool) -> Result<ExportResult> {
+        self.export_git_to(git_dir, force, "refs/heads/")
+    }
+
+    /// export_git, writing each branch to <prefix><branch>.
+    pub fn export_git_to(&self, git_dir: &str, force: bool, prefix: &str) -> Result<ExportResult> {
         let mut res = ExportResult::default();
         git_output(git_dir, &["rev-parse", "--git-dir"])?;
         let refs = self.list_refs();
@@ -378,7 +397,8 @@ impl Repo {
         let _cleanup = Rm(marks_file.clone());
         let mut cmd = Command::new("git");
         cmd.args(["-C", git_dir, "fast-import", "--quiet"]).arg(format!("--export-marks={}", marks_file.display()));
-        if force {
+        // sprig's own namespace may move any way (undo); refs/heads/ only on --force
+        if force || prefix != "refs/heads/" {
             cmd.arg("--force");
         }
         let mut child =
@@ -407,7 +427,7 @@ impl Repo {
                     continue;
                 }
                 let r = ex.export(id).map_err(|e| err!("change {}: {e}", short(id)))?;
-                write!(ex.w, "reset refs/heads/{b}\nfrom {r}\n\n")?;
+                write!(ex.w, "reset {prefix}{b}\nfrom {r}\n\n")?;
                 exported.push(b.clone());
             }
             ex.w.flush()?;
@@ -433,7 +453,7 @@ impl Repo {
             let _ = crate::store::write_file_atomic(&self.git_map_path(), &crate::util::to_json(&known), false);
         }
         for b in exported {
-            res.branches.insert(b.clone(), git_output(git_dir, &["rev-parse", &format!("refs/heads/{b}")])?);
+            res.branches.insert(b.clone(), git_output(git_dir, &["rev-parse", &format!("{prefix}{b}")])?);
         }
         Ok(res)
     }
@@ -483,8 +503,19 @@ impl<W: Write> Exporter<'_, W> {
     }
 
     fn write_commit(&mut self, id: &str, c: &Change) -> Result<()> {
-        let flat = self.r.flatten(&c.tree)?;
-        for fe in flat.values() {
+        // `from` starts the commit at its first parent's tree, so only what
+        // changed since goes in the stream: deletions first (a directory may
+        // become a file), then the new and edited files. A root commit lists
+        // everything.
+        let files: Vec<(String, Option<FileEnt>)> = match c.parents.first() {
+            Some(p) => {
+                let mut ds = self.r.diff_trees(&self.r.get_change(p)?.tree, &c.tree)?;
+                ds.sort_by_key(|d| d.new.is_some());
+                ds.into_iter().map(|d| (d.path, d.new)).collect()
+            }
+            None => self.r.flatten(&c.tree)?.into_iter().map(|(p, fe)| (p, Some(fe))).collect(),
+        };
+        for fe in files.iter().filter_map(|(_, fe)| fe.as_ref()) {
             if self.blobs.contains_key(&fe.id) {
                 continue;
             }
@@ -506,8 +537,14 @@ impl<W: Write> Exporter<'_, W> {
         for (i, p) in c.parents.iter().enumerate() {
             writeln!(self.w, "{} {}", if i == 0 { "from" } else { "merge" }, self.commits[p])?;
         }
-        self.w.write_all(b"deleteall\n")?;
-        for (p, fe) in &flat {
+        if c.parents.is_empty() {
+            self.w.write_all(b"deleteall\n")?;
+        }
+        for (p, fe) in &files {
+            let Some(fe) = fe else {
+                writeln!(self.w, "D {}", fast_import_path(p))?;
+                continue;
+            };
             let mode = match fe.mode {
                 Mode::Exec => "100755",
                 Mode::Link => "120000",
@@ -600,6 +637,31 @@ pub struct PullOutcome {
     pub summary: String,
     /// paths left with conflicts by merging the host's version
     pub conflicts: Vec<String>,
+    /// local branches whose GitHub branch was deleted
+    pub orphans: Vec<String>,
+}
+
+/// What a GitHub fetch did.
+#[derive(Debug, Default)]
+pub struct FetchOutcome {
+    pub summary: String,
+    /// branches GitHub deleted since the last fetch
+    pub pruned: Vec<String>,
+    /// local branches named like one of those, other than the current one
+    pub orphans: Vec<String>,
+}
+
+fn plural(n: usize, w: &str) -> String {
+    format!(
+        "{n} {w}{}",
+        if n == 1 {
+            ""
+        } else if w.ends_with('h') {
+            "es"
+        } else {
+            "s"
+        }
+    )
 }
 
 impl Repo {
@@ -608,8 +670,9 @@ impl Repo {
     }
 
     /// Makes the mirror (cloning it the first time) and fetches the host's
-    /// branches into it.
-    fn sync_mirror(&self, url: &str) -> Result<String> {
+    /// branches into it, dropping the ones the host deleted. Returns the
+    /// mirror and those deleted branches.
+    fn sync_mirror(&self, url: &str) -> Result<(String, Vec<String>)> {
         if url.is_empty() {
             bail!("no GitHub repository set");
         }
@@ -624,6 +687,7 @@ impl Repo {
                 args.extend(["-c", &set]);
             }
             git_output(".", &[&args[..], &[url, &m]].concat())?;
+            return Ok((m, vec![]));
         } else {
             if key.is_empty() {
                 let _ = git_output(&m, &["config", "--unset", "core.sshCommand"]); // fails when already unset
@@ -631,15 +695,49 @@ impl Repo {
                 git_output(&m, &["config", "core.sshCommand", &ssh])?;
             }
             git_output(&m, &["remote", "set-url", "origin", url])?;
-            git_output(&m, &["fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*"])?;
         }
-        Ok(m)
+        let heads = |m: &str| -> Result<std::collections::BTreeSet<String>> {
+            Ok(git_output(m, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?
+                .lines()
+                .map(String::from)
+                .collect())
+        };
+        let had = heads(&m)?;
+        git_output(&m, &["fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*"])?;
+        let now = heads(&m)?;
+        Ok((m, had.difference(&now).cloned().collect()))
+    }
+
+    /// Brings in GitHub's branches as git/<branch> without touching local
+    /// ones, and drops git/<branch> for branches deleted there. Local
+    /// branches named like a deleted one are reported, not deleted.
+    pub fn github_fetch(&self, url: &str) -> Result<FetchOutcome> {
+        let (m, pruned) = self.sync_mirror(url)?;
+        let res = self.import_git_as(&m, false, true)?;
+        self.record("github fetch", || {
+            for p in &pruned {
+                if self.read_ref(&format!("remotes/git/{p}")).is_some() {
+                    self.delete_ref(&format!("remotes/git/{p}"))?;
+                }
+            }
+            Ok(())
+        })?;
+        let (head_ref, _) = self.head();
+        let orphans: Vec<String> = pruned
+            .iter()
+            .filter(|p| self.read_ref(&format!("heads/{p}")).is_some() && head_ref != format!("heads/{p}"))
+            .cloned()
+            .collect();
+        let mut summary = format!("fetched {} from {url}", plural(res.branches.len(), "branch"));
+        if !pruned.is_empty() {
+            summary += &format!("; removed git/{} (deleted on GitHub)", pruned.join(", git/"));
+        }
+        Ok(FetchOutcome { summary, pruned, orphans })
     }
 
     /// Brings in the host's commits and merges the host's version of the
     /// current branch if both sides moved. Conflicts are recorded as usual.
     pub fn github_pull(&self, url: &str) -> Result<PullOutcome> {
-        let m = self.sync_mirror(url)?;
         let had: std::collections::HashSet<String> = self.list_refs().into_values().collect();
         let known = |r: &Repo| -> Result<std::collections::HashSet<String>> {
             let mut seen = std::collections::HashSet::new();
@@ -649,13 +747,16 @@ impl Repo {
             Ok(seen)
         };
         let before = known(self)?;
-        self.import_git(&m, false)?;
+        let fetched = self.github_fetch(url)?;
         let mut new = std::collections::HashSet::new();
         for tip in self.list_refs().into_values() {
             new.extend(self.ancestors(&tip)?.into_keys().filter(|id| !before.contains(id)));
         }
-        let mut out =
-            PullOutcome { summary: format!("pulled {} new change(s) from {url}", new.len()), conflicts: vec![] };
+        let mut out = PullOutcome {
+            summary: format!("pulled {} new change(s) from {url}", new.len()),
+            conflicts: vec![],
+            orphans: fetched.orphans,
+        };
         let (head_ref, cur) = self.head();
         let Some(branch) = head_ref.strip_prefix("heads/") else { return Ok(out) };
         let theirs = format!("remotes/git/{branch}");
@@ -676,7 +777,7 @@ impl Repo {
     pub fn github_push(&self, url: &str) -> Result<String> {
         let (head_ref, _) = self.head();
         let Some(branch) = head_ref.strip_prefix("heads/") else { bail!("HEAD is detached; check out a branch") };
-        let m = self.sync_mirror(url)?;
+        let (m, _) = self.sync_mirror(url)?;
         let res = self.export_git(&m, false).map_err(|e| {
             if e.to_string().contains("does not contain") {
                 err!("GitHub has commits you don't have; pull first")
@@ -690,5 +791,103 @@ impl Repo {
         git_output(&m, &["push", "--quiet", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")])
             .map_err(|e| err!("{e}\nhint: if GitHub moved, pull first"))?;
         Ok(format!("pushed {branch} to {url} ({} new commit(s))", res.commits))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The working tree's own .git, kept in step with sprig. Commits are made
+// with sprig; after every command that moves a branch or HEAD, the same
+// branches, HEAD and index show up in git, so `git log`, `git status` and
+// editors agree with sprig.
+
+/// Where fast-import writes, so a branch git moved by itself is never
+/// overwritten by accident; refs/heads/ follows from there when it is safe.
+const LOCAL_PREFIX: &str = "refs/sprig/heads/";
+
+impl Repo {
+    /// The working tree's .git, if it has one.
+    pub fn local_git(&self) -> Option<String> {
+        let g = self.root.join(".git");
+        (!self.bare && g.is_dir()).then(|| g.to_string_lossy().into_owned())
+    }
+
+    /// Mirrors a ref/HEAD movement (before -> after) into the working tree's
+    /// .git. Returns warnings; a branch git has commits on that sprig lacks
+    /// is left as it is.
+    pub fn sync_local_git(&self, before: &State, after: &State) -> Result<Vec<String>> {
+        let Some(g) = self.local_git() else { return Ok(vec![]) };
+        let mut warn = vec![];
+        // sprig's own folder is not part of the project
+        let exclude = std::path::Path::new(&g).join("info/exclude");
+        let ex = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !ex.lines().any(|l| l.trim() == "/.sprig/") {
+            std::fs::create_dir_all(exclude.parent().unwrap())?;
+            let sep = if ex.is_empty() || ex.ends_with('\n') { "" } else { "\n" };
+            std::fs::write(&exclude, format!("{ex}{sep}/.sprig/\n"))?;
+        }
+        let known: BTreeMap<String, String> =
+            std::fs::read(self.git_map_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // the git commit a sprig change is (or was exported as)
+        let sha_of = |id: &str| -> Option<String> {
+            let c = self.get_change(id).ok()?;
+            if !c.meta.git_sha.is_empty() {
+                return Some(c.meta.git_sha);
+            }
+            known.get(id).cloned()
+        };
+        let git_ref = |name: &str| git_output(&g, &["rev-parse", "--verify", "-q", name]).ok();
+        let heads = |s: &State| -> BTreeMap<String, String> {
+            s.refs.iter().filter_map(|(k, v)| Some((k.strip_prefix("heads/")?.to_string(), v.clone()))).collect()
+        };
+        let (was, now) = (heads(before), heads(after));
+        let exported =
+            if now.is_empty() { Default::default() } else { self.export_git_to(&g, false, LOCAL_PREFIX)?.branches };
+        for (b, sha) in &exported {
+            let name = format!("refs/heads/{b}");
+            let ok = match git_ref(&name) {
+                None => true,
+                Some(t) if &t == sha => continue,
+                Some(t) => {
+                    // git's tip is ours from before this command (undo moves back), one
+                    // sprig wrote, or behind the new tip: safe to move
+                    was.get(b).and_then(|id| sha_of(id)).as_deref() == Some(t.as_str())
+                        || known.values().any(|k| *k == t)
+                        || Command::new("git")
+                            .args(["-C", &g, "merge-base", "--is-ancestor", &t, sha])
+                            .status()
+                            .is_ok_and(|s| s.success())
+                }
+            };
+            if ok {
+                git_output(&g, &["update-ref", &name, sha])?;
+            } else {
+                warn.push(format!("git branch {b} has commits sprig lacks; left as is (run `sprig import-git .`)"));
+            }
+        }
+        for (b, id) in was.iter().filter(|(b, _)| !now.contains_key(*b)) {
+            let _ = git_output(&g, &["update-ref", "-d", &format!("{LOCAL_PREFIX}{b}")]);
+            if sha_of(id).is_some_and(|s| git_ref(&format!("refs/heads/{b}")) == Some(s)) {
+                git_output(&g, &["update-ref", "-d", &format!("refs/heads/{b}")])?;
+            }
+        }
+        match after.head.strip_prefix("ref: ") {
+            Some(r) => {
+                git_output(&g, &["symbolic-ref", "HEAD", &format!("refs/{r}")])?;
+            }
+            None => {
+                if let Some(sha) = sha_of(&after.head) {
+                    git_output(&g, &["update-ref", "--no-deref", "HEAD", &sha])?;
+                }
+            }
+        }
+        // the index follows HEAD (the working tree is sprig's and stays as it is)
+        let head_commit = match after.head.strip_prefix("ref: heads/") {
+            Some(b) => exported.get(b).cloned(),
+            None => sha_of(&after.head),
+        };
+        if head_commit.is_some() {
+            git_output(&g, &["reset", "-q"])?;
+        }
+        Ok(warn)
     }
 }

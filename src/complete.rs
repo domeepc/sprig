@@ -53,6 +53,8 @@ enum Arg {
     Remotes,
     Branches,
     Conflicts,
+    /// keys this repository trusts (trust -d)
+    Trusted,
     Files, // left to the shell
 }
 
@@ -60,7 +62,7 @@ fn arg(cmd: &str, pos: usize) -> Arg {
     match (cmd, pos) {
         ("completion", 0) => Arg::Words(&["bash", "zsh", "fish"]),
         ("remote", 0) => Arg::Words(&["add", "list"]),
-        ("github", 0) => Arg::Words(&["set", "key", "pull", "push"]),
+        ("github", 0) => Arg::Words(&["set", "key", "fetch", "pull", "push"]),
         ("push" | "fetch" | "pull" | "land", 0) => Arg::Remotes,
         ("push" | "fetch" | "pull" | "land", 1) => Arg::Branches,
         ("branch" | "checkout" | "merge" | "show" | "log" | "diff" | "audit", _) => Arg::Revs,
@@ -121,7 +123,8 @@ pub fn complete(words: &[String], out: Out) -> Result<()> {
                 if skip {
                     vec![] // a flag's value: let the shell offer files
                 } else {
-                    dynamic(arg(cmd, pos))
+                    let deleting = cmd == "trust" && rest.iter().any(|w| w == "-d");
+                    dynamic(if deleting { Arg::Trusted } else { arg(cmd, pos) })
                 }
             }
         }
@@ -152,6 +155,7 @@ fn dynamic(a: Arg) -> Vec<String> {
             v
         }
         Arg::Remotes => repo().map_or(vec![], |r| r.load_config().remotes.into_keys().collect()),
+        Arg::Trusted => repo().map_or(vec![], |r| r.load_config().trusted.into_keys().collect()),
         Arg::Conflicts => repo()
             .and_then(|r| {
                 let (_, head) = r.head();
@@ -223,7 +227,7 @@ mod tests {
         assert!(run(&["commit", "-"]).contains(&"--intent".to_string()));
         assert_eq!(flags("init"), [("--bare".to_string(), false), ("-b".to_string(), true)]);
         assert_eq!(flags("pull"), []);
-        assert_eq!(run(&["github", ""]), ["set", "key", "pull", "push"]);
+        assert_eq!(run(&["github", ""]), ["set", "key", "fetch", "pull", "push"]);
         assert_eq!(run(&["completion", "z"]), ["zsh"]);
         // a flag's value and file arguments are left to the shell
         assert!(run(&["commit", "-m", ""]).is_empty());

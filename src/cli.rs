@@ -76,7 +76,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   cat <id>                            print a raw object
   gc [--repack]                       pack loose objects with deltas (runs by itself when they pile up)
   watch                               keep a list of changed files so status needn't stat every file
-  github set <url> | github pull | github push
+  github set <url> | github fetch | github pull | github push
                                       sync the current branch with a GitHub (or any git) repository
   github key <file>                   ssh private key for it, e.g. a deploy key ('' = ssh's defaults)
   sparse [path... | .]                 show or change which paths are checked out (. = all)
@@ -1049,6 +1049,7 @@ fn cmd_github(r: &Repo, args: &[String], out: Out) -> Result<()> {
         [p] if p == "pull" => {
             let res = r.github_pull(&url)?;
             writeln!(out, "{}", res.summary)?;
+            orphans(out, &res.orphans)?;
             for c in &res.conflicts {
                 writeln!(out, "CONFLICT {c}")?;
             }
@@ -1057,8 +1058,25 @@ fn cmd_github(r: &Repo, args: &[String], out: Out) -> Result<()> {
                 return Err(Error::Exit(3, String::new()));
             }
         }
+        [p] if p == "fetch" => {
+            let res = r.github_fetch(&url)?;
+            writeln!(out, "{}", res.summary)?;
+            orphans(out, &res.orphans)?;
+        }
         [p] if p == "push" => writeln!(out, "{}", r.github_push(&url)?)?,
-        _ => bail!("usage: github set <url> | github key <file> | github pull | github push"),
+        _ => bail!("usage: github set <url> | github key <file> | github fetch | github pull | github push"),
+    }
+    Ok(())
+}
+
+/// Local branches whose GitHub branch was deleted: said, never deleted.
+fn orphans(out: Out, names: &[String]) -> Result<()> {
+    if !names.is_empty() {
+        writeln!(
+            out,
+            "local branches whose GitHub branch is gone: {} (delete with `sprig branch -d`)",
+            names.join(", ")
+        )?;
     }
     Ok(())
 }

@@ -481,12 +481,23 @@ impl Repo {
 
     /// Runs f and records the resulting ref/HEAD movement in the oplog, even
     /// if f failed part-way.
+    /// The working tree's .git, if any, is brought in step afterwards; a
+    /// failure there is only reported, the command itself stands.
     pub fn record<T>(&self, cmd: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let before = self.capture_state();
         let res = f();
-        let rec = self.record_op(cmd, before);
+        let rec = self.record_op(cmd, before.clone());
         let v = res?;
         rec?;
+        if self.local_git().is_some() {
+            let after = self.capture_state();
+            if after != before {
+                match self.sync_local_git(&before, &after) {
+                    Ok(warnings) => warnings.iter().for_each(|w| eprintln!("sprig: {w}")),
+                    Err(e) => eprintln!("sprig: updating .git: {e}"),
+                }
+            }
+        }
         Ok(v)
     }
 

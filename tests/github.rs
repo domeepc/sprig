@@ -115,3 +115,88 @@ fn ssh_key_goes_into_the_mirror() {
     let st = std::process::Command::new("git").arg("-C").arg(&m).args(["config", "core.sshCommand"]).status().unwrap();
     assert!(!st.success());
 }
+
+/// A working tree that also has a .git: every sprig command shows up there.
+#[test]
+fn local_git_follows_sprig() {
+    if !has_git() {
+        return;
+    }
+    let c = Ctx::new();
+    let d = c.dir();
+    git(&d, &["init", "-q", "-b", "main"]);
+    c.write("a.txt", "one\n");
+    c.must(&["commit", "-m", "first"]);
+    assert_eq!(git(&d, &["log", "-1", "--format=%s"]), "first");
+    assert_eq!(git(&d, &["status", "--porcelain"]), "", "index follows HEAD, .sprig is excluded");
+    let first = git(&d, &["rev-parse", "HEAD"]);
+
+    c.write("a.txt", "two\n");
+    c.must(&["commit", "-m", "second"]);
+    assert_eq!(git(&d, &["show", "HEAD:a.txt"]), "two");
+    c.must(&["undo"]);
+    assert_eq!(git(&d, &["rev-parse", "main"]), first, "undo moves git's branch back too");
+
+    c.must(&["branch", "side"]);
+    assert_eq!(git(&d, &["rev-parse", "side"]), first);
+    c.must(&["checkout", "side"]);
+    assert_eq!(git(&d, &["symbolic-ref", "--short", "HEAD"]), "side");
+    c.must(&["checkout", "main"]);
+    c.must(&["branch", "-d", "side"]);
+    assert_eq!(git(&d, &["branch", "--list", "side"]), "");
+
+    // a commit made with git alone is never overwritten
+    git(&d, &["commit", "-q", "--allow-empty", "-m", "git only"]);
+    let mine = git(&d, &["rev-parse", "main"]);
+    c.write("a.txt", "three\n");
+    c.must(&["commit", "-m", "third"]);
+    assert_eq!(git(&d, &["rev-parse", "main"]), mine);
+}
+
+#[test]
+fn fetch_prunes_deleted_branches() {
+    if !has_git() {
+        return;
+    }
+    let mut c = Ctx::new();
+    let (hub, url) = host(&mut c);
+    git(&hub, &["branch", "old", "main"]);
+    c.must(&["github", "set", &url]);
+    c.must(&["github", "pull"]);
+    assert!(!c.must(&["branch"]).contains("old"), "fetch leaves local branches alone");
+    c.must(&["branch", "old", "git/old"]);
+
+    git(&hub, &["branch", "-D", "old"]);
+    let out = c.must(&["github", "fetch"]);
+    assert!(out.contains("removed git/old"), "{out}");
+    assert!(out.contains("GitHub branch is gone: old"), "{out}");
+    assert!(c.sp(&["show", "git/old"]).is_err(), "git/old is gone");
+    assert!(c.must(&["branch"]).contains("old"), "the local branch stays until deleted");
+}
+
+/// Commits are written as changes against their parent; the trees must
+/// still come out whole.
+#[test]
+fn export_writes_only_changes_but_whole_trees() {
+    if !has_git() {
+        return;
+    }
+    let mut c = Ctx::new();
+    let out = c.temp();
+    git(&out, &["init", "-q", "--bare"]);
+    c.write("a.txt", "one\n");
+    c.write("b.txt", "bee\n");
+    c.write("dir/x", "x\n");
+    c.must(&["commit", "-m", "first"]);
+    c.write("a.txt", "two\n");
+    std::fs::remove_file(c.path("b.txt")).unwrap();
+    std::fs::remove_dir_all(c.path("dir")).unwrap();
+    c.write("dir", "now a file\n");
+    c.write("c/d.txt", "new\n");
+    c.must(&["commit", "-m", "second"]);
+    c.must(&["export-git", out.to_str().unwrap()]);
+    assert_eq!(git(&out, &["ls-tree", "-r", "--name-only", "main"]), "a.txt\nc/d.txt\ndir");
+    assert_eq!(git(&out, &["show", "main:a.txt"]), "two");
+    assert_eq!(git(&out, &["show", "main:dir"]), "now a file");
+    assert_eq!(git(&out, &["ls-tree", "-r", "--name-only", "main~1"]), "a.txt\nb.txt\ndir/x");
+}
