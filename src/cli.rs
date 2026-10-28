@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
-type Out<'a> = &'a mut dyn Write;
+pub type Out<'a> = &'a mut dyn Write;
 
 pub fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,8 +41,11 @@ pub fn main() {
 }
 
 fn usage() {
-    eprint!(
-        "sprig - a small version control system for humans and agents
+    eprint!("{USAGE}");
+}
+
+/// What `sprig help` prints; shell completion reads the flags from it.
+pub const USAGE: &str = "sprig - a small version control system for humans and agents
 
 usage: sprig <command> [flags] [args]     (flags go before positional args)
 
@@ -76,11 +79,12 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
   github set <url> | github pull | github push
                                       sync the current branch with a GitHub (or any git) repository
   sparse [path... | .]                 show or change which paths are checked out (. = all)
+  completion bash|zsh|fish            print a shell completion script (Tab completes commands,
+                                      flags, branches, remotes and conflicted paths)
+  version                             print the version
 
 environment: SPRIG_AUTHOR, SPRIG_AGENT, SPRIG_MODEL, SPRIG_TOKEN, SPRIG_KEY (signing key file)
-"
-    );
-}
+";
 
 // ---------------------------------------------------------------------------
 // Flags, parsed as Go's flag package does: "-f" or "--f", "-f=v" or "-f v",
@@ -255,6 +259,11 @@ pub fn run(cmd: &str, args: &[String], out: Out) -> Result<()> {
             return Ok(());
         }
         "clone" => return cmd_clone(args, out),
+        "completion" => {
+            out.write_all(crate::complete::script(args.first().map_or("", String::as_str))?.as_bytes())?;
+            return Ok(());
+        }
+        "__complete" => return crate::complete::complete(args, out),
         _ => {}
     }
     let r = Repo::find()?;

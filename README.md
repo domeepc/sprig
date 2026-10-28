@@ -38,6 +38,17 @@ cargo install --locked --path .    # installs to ~/.cargo/bin
 sprig version
 ```
 
+Tab completion of commands, flags, branches, remotes and conflicted paths:
+
+```sh
+echo 'eval "$(sprig completion bash)"' >> ~/.bashrc
+echo 'source <(sprig completion zsh)' >> ~/.zshrc      # after compinit
+sprig completion fish > ~/.config/fish/completions/sprig.fish
+```
+
+The scripts are a few lines that ask `sprig __complete` what fits, so
+completion knows your branches and remotes and never goes out of date.
+
 `~/.cargo/bin` must be on your PATH (rustup sets that up). To build without
 installing: `cargo build --release`, which leaves the binary in
 `target/release/sprig`.
@@ -419,6 +430,7 @@ src/sign.rs       ed25519 change signatures
 src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
+src/complete.rs   shell completion (bash, zsh, fish)
 src/bin/sprig-ui.rs  the desktop app (`--features ui`)
 tests/            integration tests (CLI as a subprocess, servers in-process)
 bench/            git vs sprig benchmark (run.sh), charts (chart.py), results
