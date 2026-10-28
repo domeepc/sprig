@@ -57,6 +57,24 @@ Then, once:
 Update with `git pull && cargo install --locked --path .`; uninstall with
 `cargo uninstall sprig` (and delete `~/.config/sprig`).
 
+### For AI agents
+
+`sprig mcp` serves sprig's commands as [MCP](https://modelcontextprotocol.io)
+tools on stdin/stdout: status, log, diff, show, commit, branch, checkout,
+merge, conflicts, resolve, undo, ops, audit, land and github. They run the
+same code as the CLI, so everything lands in `sprig ops` (and a `.git`
+alongside), and changes are credited to the client by name unless the call
+or `SPRIG_AGENT` says otherwise. This repository's `.mcp.json` registers it
+for Claude Code; elsewhere:
+
+```sh
+claude mcp add sprig -- sprig mcp            # or any MCP client: command "sprig", args ["mcp"]
+```
+
+`.claude/skills/sprig-cli/SKILL.md` teaches an agent the CLI: committing with an
+intent and only the checks it ran, partial commits, recorded conflicts,
+undo and GitHub sync.
+
 ## Desktop app
 
 `sprig-ui` is a window on a repository for Linux, macOS and Windows: Rust
@@ -434,6 +452,7 @@ src/watch.rs      `sprig watch` file watcher (notify)
 src/util.rs       errors, hex, varints, Go-compatible JSON, globs, time
 src/cli.rs        the command line
 src/complete.rs   shell completion (bash, zsh, fish)
+src/mcp.rs        `sprig mcp`: the commands as MCP tools over stdio
 src/bin/sprig-ui.rs  the desktop app's commands (`--features ui`)
 ui/               the desktop app's page (web/), Tauri config, icon
 tests/            integration tests (CLI as a subprocess, servers in-process)

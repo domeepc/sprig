@@ -43,6 +43,7 @@ pub const COMMANDS: &[&str] = &[
     "github",
     "sparse",
     "completion",
+    "mcp",
     "version",
 ];
 

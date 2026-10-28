@@ -10,6 +10,7 @@ pub mod complete;
 pub mod diff;
 pub mod git;
 pub mod index;
+pub mod mcp;
 pub mod merge;
 pub mod pack;
 pub mod project;

@@ -770,3 +770,57 @@ fn signs_with_a_key_in_ssh_agent() {
     let _ = agent.wait();
     assert!(audit.starts_with("0 of 1"), "{audit}");
 }
+
+/// `sprig mcp` answers JSON-RPC on stdio; tools run sprig commands and
+/// credit changes to the client.
+#[test]
+fn mcp_server_runs_tools() {
+    use std::io::{BufRead, BufReader, Write};
+    let c = Ctx::new();
+    c.write("a.txt", "hello\n");
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_sprig"))
+        .args(["mcp", "--repo", c.dir().to_str().unwrap()])
+        .envs(c.env.borrow().iter())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = p.stdin.take().unwrap();
+    let mut out = BufReader::new(p.stdout.take().unwrap());
+    fn send(w: &mut impl Write, r: &mut impl BufRead, msg: serde_json::Value) -> serde_json::Value {
+        writeln!(w, "{msg}").unwrap();
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    let mut ask = |msg| send(&mut stdin, &mut out, msg);
+    let init = ask(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-agent","version":"1"}}}));
+    assert_eq!(init["result"]["serverInfo"]["name"], "sprig");
+    drop(ask);
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap(); // no reply
+    let mut ask = |msg| send(&mut stdin, &mut out, msg);
+    let tools = ask(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    let names: Vec<&str> =
+        tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"commit") && names.contains(&"merge") && names.contains(&"undo"), "{names:?}");
+
+    let commit = ask(serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"commit",
+        "arguments":{"message":"via mcp","intent":"test the server","checks":{"tests":"pass"}}}}));
+    assert_eq!(commit["result"]["isError"], false, "{commit}");
+    let log = ask(
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"log","arguments":{"n":1}}}),
+    );
+    let text = log["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("via mcp") && text.contains("test-agent") && text.contains("tests=pass"), "{text}");
+
+    let bad = ask(
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"resolve","arguments":{"side":"mine","paths":["a.txt"]}}}),
+    );
+    assert_eq!(bad["result"]["isError"], true);
+    let none = ask(serde_json::json!({"jsonrpc":"2.0","id":6,"method":"nope"}));
+    assert_eq!(none["error"]["code"], -32601);
+    drop(ask);
+    drop(stdin);
+    assert!(p.wait().unwrap().success());
+}

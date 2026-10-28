@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sprig": {
+      "command": "sprig",
+      "args": ["mcp"]
+    }
+  }
+}

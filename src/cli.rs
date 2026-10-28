@@ -80,6 +80,7 @@ usage: sprig <command> [flags] [args]     (flags go before positional args)
                                       sync the current branch with a GitHub (or any git) repository
   github key <file>                   ssh private key for it, e.g. a deploy key ('' = ssh's defaults)
   sparse [path... | .]                 show or change which paths are checked out (. = all)
+  mcp [--repo dir]                    serve sprig's commands as MCP tools on stdin/stdout (for AI agents)
   completion bash|zsh|fish            print a shell completion script (Tab completes commands,
                                       flags, branches, remotes and conflicted paths)
   version                             print the version
@@ -249,6 +250,7 @@ pub fn run(cmd: &str, args: &[String], out: Out) -> Result<()> {
             return Ok(());
         }
         "init" => return cmd_init(args, out),
+        "mcp" => return crate::mcp::serve(args),
         "serve" => return cmd_serve(args, out),
         "keygen" => {
             let (path, key) = match args {
