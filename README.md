@@ -60,20 +60,22 @@ Update with `git pull && cargo install --locked --path .`; uninstall with
 ### For AI agents
 
 `sprig mcp` serves sprig's commands as [MCP](https://modelcontextprotocol.io)
-tools on stdin/stdout: status, log, diff, show, commit, branch, checkout,
-merge, conflicts, resolve, undo, ops, audit, land and github. They run the
-same code as the CLI, so everything lands in `sprig ops` (and a `.git`
-alongside), and changes are credited to the client by name unless the call
-or `SPRIG_AGENT` says otherwise. This repository's `.mcp.json` registers it
-for Claude Code; elsewhere:
+tools (status, log, diff, show, commit, branch, checkout, merge, conflicts,
+resolve, undo, ops, audit, land, github). They run the same code as the CLI,
+so everything is in `sprig ops`, and changes are credited to the client by
+name. Claude Code picks it up from this repository's `.mcp.json`; elsewhere:
 
 ```sh
-claude mcp add sprig -- sprig mcp            # or any MCP client: command "sprig", args ["mcp"]
+claude mcp add sprig -- sprig mcp     # any MCP client: command "sprig", args ["mcp", "--repo", "<dir>"]
 ```
 
-`.claude/skills/sprig-cli/SKILL.md` teaches an agent the CLI: committing with an
-intent and only the checks it ran, partial commits, recorded conflicts,
-undo and GitHub sync.
+[docs/mcp.md](docs/mcp.md) has setup for Claude Code, Claude Desktop and
+Cursor, every tool's arguments, how results and conflicts come back, a
+by-hand test and troubleshooting. The `sprig-cli` skill
+(`.claude/skills/sprig-cli/SKILL.md`) teaches an agent the CLI itself;
+[docs/skill.md](docs/skill.md) shows how to install it for Claude Code (this
+project, another one, or all of them) and how to use it with Cursor or
+`AGENTS.md`.
 
 ## Desktop app
 
