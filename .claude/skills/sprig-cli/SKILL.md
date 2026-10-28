@@ -13,7 +13,9 @@ commits are left alone and warned about, not picked up).
 The same commands exist as MCP tools (`status`, `log`, `diff`, `show`,
 `commit`, `branch`, `checkout`, `merge`, `conflicts`, `resolve`, `undo`,
 `ops`, `audit`, `land`, `github`) when the `sprig` MCP server is connected
-(`sprig mcp`); prefer them over the shell when available.
+(`sprig mcp`; setup in docs/mcp.md); prefer them over the shell when
+available. `commit` and `land` take the same `intent`, `checks` and `model`
+as the flags below.
 
 ## Committing
 
