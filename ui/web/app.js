@@ -23,6 +23,7 @@ const PATHS = {
   check: '<path d="M20 6 9 17l-5-5"/>',
   cross: '<path d="M18 6 6 18M6 6l12 12"/>',
   merge: '<circle cx="6" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><path d="M6 8v2a8 8 0 0 0 8 8h2"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
   up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
   refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
@@ -249,6 +250,7 @@ function sidebar() {
     ${nav("changes", "diff", "Changes", S.changes.length)}
     ${nav("history", "clock", "History", 0)}
     ${nav("conflicts", "warn", "Conflicts", S.conflicts.length, S.conflicts.length > 0)}
+    ${nav("settings", "gear", "Settings", 0)}
     ${ws.length ? `<div class="label">This week</div>${people}` : ""}
     ${syncCard()}`;
 }
@@ -288,7 +290,7 @@ function header() {
     return `<div class="crumb"><button class="back" data-act="back">${icon("left", 14)} History</button>
       <span style="color:#3a3a40">/</span><h1>${esc(c?.title ?? "")}</h1><span class="mono small muted">${esc(c?.short ?? "")}</span></div>`;
   }
-  const title = { inbox: "Inbox", changes: "Changes", history: "History", conflicts: "Conflicts" }[V.tab];
+  const title = { inbox: "Inbox", changes: "Changes", history: "History", conflicts: "Conflicts", settings: "Settings" }[V.tab];
   const seg = ["inbox", "history"].includes(V.tab)
     ? `<div class="seg" role="group" aria-label="Show">${["all", "agents", "people"]
         .map((w) => `<button class="${V.who === w ? "on" : ""}" aria-pressed="${V.who === w}" data-act="who" data-who="${w}">${w[0].toUpperCase() + w.slice(1)}</button>`)
@@ -426,6 +428,29 @@ function changePage() {
     <div class="right">${diffView(D.diff, false)}</div></div>`;
 }
 
+function settingsPage() {
+  const k = V.signing;
+  if (!k) return '<div class="content"><div class="empty">Loading…</div></div>';
+  const env = k.env_author
+    ? `<p class="note">SPRIG_AUTHOR is set (<span class="mono">${esc(k.env_author)}</span>) and wins over this.</p>`
+    : "";
+  const author = `<form class="form" onsubmit="return false">
+    <label>Name<input type="text" id="a-name" value="${esc(k.name)}" autocomplete="name"></label>
+    <label>Email<input type="text" id="a-email" value="${esc(k.email)}" autocomplete="email" inputmode="email"></label>
+    ${env}<div class="end"><button class="btn primary" data-act="author">Save author</button></div></form>`;
+  const current = k.key
+    ? `<div class="sig ${k.trusted ? "ok" : "warn"}">${icon("shield", 15)}<div><b>${k.trusted ? "Signing; trusted in this repository" : "Signing; not trusted in this repository yet"}</b>
+        <span title="${esc(k.key)}">${esc(k.key)}</span><span title="${esc(k.key_file)}">${esc(k.key_file)}</span></div>
+        ${k.trusted ? "" : '<button class="btn" style="margin-left:auto" data-act="key-trust">Trust it</button>'}</div>`
+    : '<div class="sig">' + icon("shield", 15) + "<div><b>Not signing</b><span>pick a key below</span></div></div>";
+  const signing = `<div class="form">${current}
+    <span class="heading">${k.key ? "Switch to" : "Sign with"}</span>${keyPicker(k)}
+    <p class="note">An ed25519 SSH key without a passphrase works as is. Switching moves a sprig key aside to signing.key.old.</p>
+    <div class="end"><button class="btn primary" data-act="key-replace">${k.key ? "Switch key" : "Use this key"}</button></div></div>`;
+  return `<div class="content" style="max-width:720px">${section("", "Commit author", "<span>this repository</span>", author)}
+    ${section("", "Signing key", "<span>all repositories</span>", signing)}</div>`;
+}
+
 function conflictsPage() {
   if (!S.conflicts.length) return '<div class="content"><div class="empty">No unresolved conflicts</div></div>';
   const chips = S.conflicts
@@ -538,7 +563,7 @@ function render() {
   const scroll = $("page").scrollTop;
   $("side").innerHTML = sidebar();
   $("top").innerHTML = header();
-  $("page").innerHTML = { inbox, changes: changesPage, history: historyPage, conflicts: conflictsPage }[V.tab]();
+  $("page").innerHTML = { inbox, changes: changesPage, history: historyPage, conflicts: conflictsPage, settings: settingsPage }[V.tab]();
   $("page").scrollTop = scroll;
   const at = S.head ? `${S.branch} at ${S.head.slice(0, 7)}` : "no changes yet";
   $("status").innerHTML = V.busy
@@ -552,6 +577,7 @@ async function go(tab, focus) {
   V.menu = false;
   if (tab === "changes") await loadWorking();
   if (tab === "conflicts") await loadConflict(V.conflict ?? S.conflicts[0] ?? null);
+  if (tab === "settings") await loadSigning();
   render();
   if (focus) $(focus)?.focus();
 }
@@ -614,6 +640,18 @@ document.addEventListener("click", async (ev) => {
     }
     case "keys": return openKeys();
     case "keys-use": return useKey();
+    case "key-replace": return useKey(true);
+    case "key-trust": return useKey(false);
+    case "author": {
+      try {
+        await invoke("set_author", { name: $("a-name").value, email: $("a-email").value });
+        V.status = { ok: true, text: "author saved" };
+      } catch (e) {
+        V.status = { ok: false, text: String(e) };
+      }
+      await loadSigning();
+      return render();
+    }
     case "keys-later":
       try {
         localStorage.setItem("sprig.keys-later", "1");
@@ -663,23 +701,28 @@ document.addEventListener("keydown", (ev) => {
 
 async function loadSigning() {
   try {
-    V.signing = await invoke("signing");
+    V.signing = await invoke("settings");
   } catch {
     V.signing = null;
   }
 }
 
-function openKeys(error = "") {
-  const k = V.signing;
-  if (!k) return;
+/// Radio options: each ed25519 SSH key, then a new sprig key.
+function keyPicker(k) {
   const keys = k.ssh
     .map(([path, comment], i) => `<label class="opt"><input type="radio" name="key" value="${esc(path)}" ${i === 0 ? "checked" : ""}>
       <span><b class="mono">${esc(path.replace(/^.*\//, ""))}</b><small>${esc(comment || path)}</small></span></label>`)
     .join("");
+  return `<div class="opts">${keys}<label class="opt"><input type="radio" name="key" value="" ${k.ssh.length ? "" : "checked"}>
+    <span><b>Create a new sprig key</b><small>sprig keygen</small></span></label></div>`;
+}
+
+function openKeys(error = "") {
+  const k = V.signing;
+  if (!k) return;
   const mine = k.key
     ? `<p class="muted">You sign with <span class="mono">${esc(k.key.slice(0, 24))}…</span>; this repository doesn't trust it yet.</p>`
-    : `<div class="opts">${keys}<label class="opt"><input type="radio" name="key" value="" ${k.ssh.length ? "" : "checked"}>
-        <span><b>Create a new sprig key</b><small>sprig keygen</small></span></label></div>`;
+    : keyPicker(k);
   $("keys").innerHTML = `<form method="dialog">
     <h2>${icon("shield", 16, "#3fb950")} Sign your changes</h2>
     <p class="muted">Signed changes show who really made them, and <span class="mono">sprig audit --signed</span> checks them.
@@ -690,17 +733,21 @@ function openKeys(error = "") {
   if (!$("keys").open) $("keys").showModal();
 }
 
-async function useKey() {
-  const picked = document.querySelector('#keys input[name="key"]:checked');
+async function useKey(replace = false) {
+  const root = replace ? $("page") : $("keys");
+  const picked = root.querySelector('input[name="key"]:checked');
   try {
-    const key = await invoke("setup_signing", { ssh: picked?.value || null });
-    $("keys").close();
+    const key = await invoke("setup_signing", { ssh: picked?.value || null, replace });
+    if ($("keys").open) $("keys").close();
     V.status = { ok: true, text: `signing with ${key}` };
     await loadSigning();
     if (V.change) await openChange(V.change);
     render();
   } catch (e) {
-    openKeys(String(e));
+    if (replace) {
+      V.status = { ok: false, text: String(e) };
+      render();
+    } else openKeys(String(e));
   }
 }
 

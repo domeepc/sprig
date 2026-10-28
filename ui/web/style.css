@@ -310,8 +310,8 @@ details:not([open]) > summary > svg:first-child { transform: rotate(-90deg); }
 .dfile > .fh .p { font: 12.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .dfile > .fh .n { margin-left: auto; font-size: 12px; color: var(--faint); white-space: nowrap; }
 .hh { padding: 4px 12px; background: var(--hunk); color: #8fb0f5; font: 12px var(--mono); border-bottom: 1px solid #1d2638; }
-.code { font: 12.5px/20px var(--mono); overflow-x: auto; }
-.code .l { display: flex; min-width: max-content; }
+.code { font: 12.5px/20px var(--mono); overflow-x: auto; display: grid; grid-template-columns: minmax(100%, max-content); }
+.code .l { display: flex; }
 .code .num { width: 48px; flex-shrink: 0; text-align: right; padding-right: 8px; color: #5d5d66; user-select: none; }
 .code .sign { width: 18px; flex-shrink: 0; text-align: center; color: var(--faint); user-select: none; }
 .code .t { white-space: pre; padding-right: 12px; }
@@ -334,6 +334,13 @@ details:not([open]) > summary > svg:first-child { transform: rotate(-90deg); }
 .side .box .fh { display: flex; gap: 8px; align-items: baseline; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
 .side pre { margin: 0; padding: 10px 12px; font: 12.5px/20px var(--mono); max-height: 240px; overflow: auto; }
 .editor { width: 100%; min-height: 280px; font: 12.5px/20px var(--mono); resize: vertical; }
+
+/* ---- settings ---- */
+.form { display: flex; flex-direction: column; gap: 12px; padding: 14px; }
+.form label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.form .end { display: flex; justify-content: flex-end; }
+.form .note { margin: 0; font-size: 12px; color: var(--faint); }
+.form .opts { margin: 0; }
 
 /* ---- signing dialog ---- */
 dialog {

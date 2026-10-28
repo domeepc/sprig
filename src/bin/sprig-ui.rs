@@ -348,20 +348,28 @@ fn save(path: String, text: String) -> Res<()> {
 }
 
 #[derive(Serialize)]
-struct Signing {
-    /// the public half of the signing key, if there is one
+struct Settings {
+    /// this repository's commit author, split
+    name: String,
+    email: String,
+    /// SPRIG_AUTHOR is set and wins over the above
+    env_author: String,
+    /// the public half of the signing key, if there is one, and its file
     key: Option<String>,
-    /// whether this repository trusts it
+    key_file: String,
+    /// whether this repository trusts the key
     trusted: bool,
     /// ed25519 SSH keys that could sign instead: (private key path, its .pub line's comment)
     ssh: Vec<(String, String)>,
 }
 
 #[tauri::command(async)]
-fn signing() -> Res<Signing> {
+fn settings() -> Res<Settings> {
     let r = repo()?;
-    let key = sprig::sign::my_public_key().map_err(|e| e.to_string())?;
-    let trusted = key.as_ref().is_some_and(|k| r.load_config().trusted.contains_key(k));
+    let e = |e: Error| e.to_string();
+    let cfg = r.load_config();
+    let (name, email) = cfg.author.split_once(" <").unwrap_or((&cfg.author, ""));
+    let key = sprig::sign::my_public_key().map_err(e)?;
     let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".ssh");
     let mut ssh = vec![];
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -373,19 +381,50 @@ fn signing() -> Res<Signing> {
         }
     }
     ssh.sort();
-    Ok(Signing { key, trusted, ssh })
+    Ok(Settings {
+        name: name.into(),
+        email: email.trim_end_matches('>').into(),
+        env_author: std::env::var("SPRIG_AUTHOR").unwrap_or_default(),
+        trusted: key.as_ref().is_some_and(|k| cfg.trusted.contains_key(k)),
+        key,
+        key_file: sprig::sign::key_file().map_err(e)?.display().to_string(),
+        ssh,
+    })
 }
 
-/// Signs with the given SSH key, or a new sprig key when there is none, and
-/// trusts that key in this repository so its changes verify.
+/// Sets this repository's commit author.
 #[tauri::command(async)]
-fn setup_signing(ssh: Option<String>) -> Res<String> {
+fn set_author(name: String, email: String) -> Res<()> {
+    let (name, email) = (name.trim(), email.trim());
+    if name.is_empty() || [name, email].iter().any(|s| s.contains(['<', '>', '\n'])) {
+        return Err("give a name, and an email without < > or line breaks".into());
+    }
+    let r = repo()?;
+    let mut cfg = r.load_config();
+    cfg.author = format!("{name} <{email}>");
+    r.save_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Signs with the given SSH key, or a new sprig key when ssh is None, and
+/// trusts that key in this repository so its changes verify. Without
+/// replace, an existing key is kept and only trusted.
+#[tauri::command(async)]
+fn setup_signing(ssh: Option<String>, replace: bool) -> Res<String> {
     let r = repo()?;
     let e = |e: Error| e.to_string();
-    let key = match (sprig::sign::my_public_key().map_err(e)?, ssh) {
-        (Some(k), _) => k, // already signing: only trust it here
-        (None, Some(p)) => sprig::sign::link_ssh_key(std::path::Path::new(&p)).map_err(e)?.1,
-        (None, None) => sprig::sign::generate_key().map_err(e)?.1,
+    let current = sprig::sign::my_public_key().map_err(e)?;
+    let key = match current {
+        Some(k) if !replace => k,
+        _ => {
+            if let Some(p) = &ssh {
+                sprig::sign::read_ssh_key(std::path::Path::new(p)).map_err(e)?; // before the old key moves
+            }
+            sprig::sign::retire_key().map_err(e)?;
+            match ssh {
+                Some(p) => sprig::sign::link_ssh_key(std::path::Path::new(&p)).map_err(e)?.1,
+                None => sprig::sign::generate_key().map_err(e)?.1,
+            }
+        }
     };
     let mut cfg = r.load_config();
     let name = cfg.author.split(" <").next().filter(|n| !n.is_empty()).map(String::from);
@@ -412,7 +451,8 @@ fn main() {
             run,
             conflict,
             save,
-            signing,
+            settings,
+            set_author,
             setup_signing
         ])
         .run(tauri::generate_context!("ui/tauri.conf.json"))

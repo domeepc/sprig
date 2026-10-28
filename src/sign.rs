@@ -132,10 +132,15 @@ pub fn ssh_public(line: &str) -> Option<String> {
     Some(format!("{KEY_PREFIX}{}", B64.encode(key)))
 }
 
+/// An SSH private key file, if sprig can sign with it.
+pub fn read_ssh_key(ssh: &std::path::Path) -> Result<SigningKey> {
+    let text = std::fs::read_to_string(ssh).map_err(|e| err!("{}: {e}", ssh.display()))?;
+    Ok(SigningKey::from_bytes(&openssh_seed(&text).map_err(|e| err!("{}: {e}", ssh.display()))?))
+}
+
 /// Signs with an SSH key from now on: the signing key path points at it.
 pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
-    let text = std::fs::read_to_string(ssh)?;
-    let key = SigningKey::from_bytes(&openssh_seed(&text).map_err(|e| err!("{}: {e}", ssh.display()))?);
+    let key = read_ssh_key(ssh)?;
     let p = key_path()?;
     if p.exists() {
         bail!("{} already exists", p.display());
@@ -149,6 +154,29 @@ pub fn link_ssh_key(ssh: &std::path::Path) -> Result<(PathBuf, String)> {
     #[cfg(not(unix))]
     std::fs::copy(&ssh, &p)?; // ponytail: a copy, not a link; symlinks need admin rights on Windows
     Ok((p, public_key(&key)))
+}
+
+/// Moves the signing key out of the way before another takes its place: a
+/// link to an SSH key is removed, a sprig key is kept as signing.key.old.
+pub fn retire_key() -> Result<()> {
+    let p = key_path()?;
+    match std::fs::symlink_metadata(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+        Ok(m) if m.file_type().is_symlink() => Ok(std::fs::remove_file(&p)?),
+        Ok(_) => {
+            let old = p.with_extension("key.old");
+            if old.exists() {
+                bail!("{} already exists; move it away first", old.display());
+            }
+            Ok(std::fs::rename(&p, &old)?)
+        }
+    }
+}
+
+/// Where the signing key lives (SPRIG_KEY or the default).
+pub fn key_file() -> Result<PathBuf> {
+    key_path()
 }
 
 /// The public half of the user's signing key, if they have one.
